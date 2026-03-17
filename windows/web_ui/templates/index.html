@@ -1,0 +1,256 @@
+{% extends "base.html" %}
+
+{% block content %}
+<!-- Header bar -->
+<div class="timeline-header">
+  <div class="date-nav">
+    <button id="btn-prev-day" class="btn-icon" title="Previous day">&#8249;</button>
+    <span id="current-date-label" class="date-label"></span>
+    <button id="btn-next-day" class="btn-icon" title="Next day">&#8250;</button>
+    <button id="btn-today" class="btn-secondary btn-sm">Today</button>
+  </div>
+
+  <div class="recording-controls">
+    <div id="status-indicator" class="status-dot status-unknown"></div>
+    <span id="status-label" class="status-text">Checking…</span>
+    <button id="btn-toggle-recording" class="btn-primary">…</button>
+    <button id="btn-analyze-now" class="btn-secondary" title="Run analysis now">Analyse now</button>
+  </div>
+</div>
+
+<!-- Ollama warning banner (hidden when Ollama is available) -->
+<div id="ollama-warning" class="alert alert-warning" style="display:none">
+  ⚠️ Ollama is not running or not reachable at <strong id="ollama-url-display"></strong>.
+  Start Ollama and refresh, or update the URL in
+  <a href="/settings">Settings</a>.
+</div>
+
+<!-- Timeline cards -->
+<div id="timeline-container" class="timeline">
+  <div id="timeline-empty" class="timeline-empty" style="display:none">
+    <p>No activity recorded yet for this day.</p>
+    <p class="hint">Screenshots are taken every few seconds while recording is active. Analysis runs automatically every minute.</p>
+  </div>
+  <div id="timeline-loading" class="timeline-loading">Loading…</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  "use strict";
+
+  // ── State ──────────────────────────────────────────────────────────
+  let currentDate = new Date();
+
+  // ── Helpers ────────────────────────────────────────────────────────
+  function fmtDate(d) {
+    return d.toISOString().slice(0, 10); // YYYY-MM-DD
+  }
+
+  function friendlyDate(d) {
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(today.getDate() - 1);
+
+    if (fmtDate(d) === fmtDate(today)) return "Today";
+    if (fmtDate(d) === fmtDate(yesterday)) return "Yesterday";
+    return d.toLocaleDateString(undefined, {
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+    });
+  }
+
+  function categoryColor(cat) {
+    const map = {
+      work:          "#4f8ef7",
+      communication: "#34c97e",
+      browsing:      "#f7a53d",
+      entertainment: "#e05dff",
+      development:   "#26b8e8",
+      writing:       "#f7d03d",
+      other:         "#9ea8b8",
+    };
+    return map[cat] || map.other;
+  }
+
+  function categoryIcon(cat) {
+    const map = {
+      work:          "💼",
+      communication: "💬",
+      browsing:      "🌐",
+      entertainment: "🎬",
+      development:   "💻",
+      writing:       "✏️",
+      other:         "📋",
+    };
+    return map[cat] || map.other;
+  }
+
+  // ── UI updates ─────────────────────────────────────────────────────
+  function updateDateLabel() {
+    document.getElementById("current-date-label").textContent =
+      friendlyDate(currentDate);
+  }
+
+  function renderCards(cards) {
+    const container = document.getElementById("timeline-container");
+    const empty     = document.getElementById("timeline-empty");
+    const loading   = document.getElementById("timeline-loading");
+
+    loading.style.display  = "none";
+
+    // Remove existing cards (keep empty + loading nodes)
+    container
+      .querySelectorAll(".timeline-card")
+      .forEach((el) => el.remove());
+
+    if (!cards || cards.length === 0) {
+      empty.style.display = "block";
+      return;
+    }
+    empty.style.display = "none";
+
+    cards.forEach((card) => {
+      const color = categoryColor(card.category);
+      const icon  = categoryIcon(card.category);
+
+      const el = document.createElement("div");
+      el.className = "timeline-card";
+      el.innerHTML = `
+        <div class="card-accent" style="background:${color}"></div>
+        <div class="card-body">
+          <div class="card-header">
+            <span class="card-icon">${icon}</span>
+            <span class="card-title">${escHtml(card.title || "Activity")}</span>
+            <span class="card-duration">${card.duration_min} min</span>
+          </div>
+          <div class="card-time">${escHtml(card.start_label)} – ${escHtml(card.end_label)}</div>
+          ${card.summary
+            ? `<div class="card-summary">${escHtml(card.summary)}</div>`
+            : ""}
+        </div>`;
+      container.appendChild(el);
+    });
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  // ── Data fetching ──────────────────────────────────────────────────
+  async function loadTimeline() {
+    document.getElementById("timeline-loading").style.display = "block";
+    document.getElementById("timeline-empty").style.display   = "none";
+    document
+      .querySelectorAll(".timeline-card")
+      .forEach((el) => el.remove());
+
+    try {
+      const res  = await fetch(`/api/timeline?date=${fmtDate(currentDate)}`);
+      const data = await res.json();
+      renderCards(data.cards || []);
+    } catch (e) {
+      console.error("Failed to load timeline:", e);
+      document.getElementById("timeline-loading").textContent =
+        "Failed to load timeline. Is the server running?";
+    }
+  }
+
+  async function loadStatus() {
+    try {
+      const res  = await fetch("/api/status");
+      const data = await res.json();
+
+      const dot   = document.getElementById("status-indicator");
+      const label = document.getElementById("status-label");
+      const btn   = document.getElementById("btn-toggle-recording");
+
+      if (data.recording) {
+        dot.className   = "status-dot status-recording";
+        label.textContent = "Recording";
+        btn.textContent  = "Stop recording";
+        btn.dataset.action = "stop";
+      } else {
+        dot.className   = "status-dot status-stopped";
+        label.textContent = "Stopped";
+        btn.textContent  = "Start recording";
+        btn.dataset.action = "start";
+      }
+
+      const warning = document.getElementById("ollama-warning");
+      if (!data.ollama_available) {
+        document.getElementById("ollama-url-display").textContent =
+          data.ollama_url || "http://localhost:11434";
+        warning.style.display = "block";
+      } else {
+        warning.style.display = "none";
+      }
+    } catch (e) {
+      console.error("Failed to fetch status:", e);
+    }
+  }
+
+  // ── Event listeners ────────────────────────────────────────────────
+  document.getElementById("btn-prev-day").addEventListener("click", () => {
+    currentDate.setDate(currentDate.getDate() - 1);
+    updateDateLabel();
+    loadTimeline();
+  });
+
+  document.getElementById("btn-next-day").addEventListener("click", () => {
+    currentDate.setDate(currentDate.getDate() + 1);
+    updateDateLabel();
+    loadTimeline();
+  });
+
+  document.getElementById("btn-today").addEventListener("click", () => {
+    currentDate = new Date();
+    updateDateLabel();
+    loadTimeline();
+  });
+
+  document
+    .getElementById("btn-toggle-recording")
+    .addEventListener("click", async function () {
+      const action = this.dataset.action || "start";
+      await fetch(`/api/recording/${action}`, { method: "POST" });
+      await loadStatus();
+    });
+
+  document
+    .getElementById("btn-analyze-now")
+    .addEventListener("click", async () => {
+      const btn = document.getElementById("btn-analyze-now");
+      btn.disabled = true;
+      btn.textContent = "Running…";
+      try {
+        await fetch("/api/analyze", { method: "POST" });
+        await new Promise((r) => setTimeout(r, 2000));
+        await loadTimeline();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Analyse now";
+      }
+    });
+
+  // ── Init ───────────────────────────────────────────────────────────
+  updateDateLabel();
+  loadTimeline();
+  loadStatus();
+
+  // Auto-refresh every 30 seconds.
+  setInterval(() => {
+    loadStatus();
+    if (fmtDate(currentDate) === fmtDate(new Date())) {
+      loadTimeline();
+    }
+  }, 30_000);
+})();
+</script>
+{% endblock %}

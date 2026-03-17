@@ -1,0 +1,19 @@
+# Dayflow for Windows – Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+# Minimum Python version: 3.9
+
+# ── Screen capture ─────────────────────────────────────────────────────────
+mss>=9.0.0
+
+# ── Image processing ───────────────────────────────────────────────────────
+Pillow>=10.0.0
+
+# ── HTTP client (used to talk to Ollama) ───────────────────────────────────
+requests>=2.31.0
+
+# ── Web UI server ──────────────────────────────────────────────────────────
+flask>=3.0.0
+
+# ── System-tray icon (optional – gracefully skipped if not installed) ──────
+pystray>=0.19.4
