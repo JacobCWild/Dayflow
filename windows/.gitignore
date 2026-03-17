@@ -1,0 +1,26 @@
+# Python byte-code caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# pytest cache
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
