@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="settings-page">
+  <h1 class="page-title">Settings</h1>
+
+  <!-- Ollama -->
+  <section class="settings-section">
+    <h2>Ollama Configuration</h2>
+    <p class="section-desc">
+      Dayflow uses a locally-running <a href="https://ollama.com/" target="_blank">Ollama</a>
+      instance with a vision-capable model (e.g. <code>llava</code>) to analyse your screenshots.
+    </p>
+
+    <div id="ollama-status-bar" class="alert" style="margin-bottom:1rem"></div>
+
+    <label class="form-label">Ollama URL
+      <input id="input-ollama-url" class="form-input" type="text"
+             value="{{ ollama_url }}" placeholder="http://localhost:11434" />
+    </label>
+
+    <label class="form-label">Model
+      <div style="display:flex;gap:.5rem;align-items:center">
+        <input id="input-ollama-model" class="form-input" type="text"
+               value="{{ ollama_model }}" placeholder="llava" style="flex:1" />
+        <button id="btn-refresh-models" class="btn-secondary btn-sm">Refresh list</button>
+      </div>
+    </label>
+
+    <div id="model-list" class="model-list" style="display:none"></div>
+
+    <div class="hint">
+      Pull a vision model first: <code>ollama pull llava</code> (or
+      <code>ollama pull llava-llama3</code> for better quality).
+    </div>
+  </section>
+
+  <!-- Capture -->
+  <section class="settings-section">
+    <h2>Screen Capture</h2>
+
+    <label class="form-label">Capture interval (seconds)
+      <input id="input-interval" class="form-input" type="number"
+             min="5" max="300" value="{{ capture_interval }}" style="width:100px" />
+    </label>
+    <div class="hint">Minimum 5 seconds. Lower values create more screenshots but use more storage.</div>
+  </section>
+
+  <!-- Storage -->
+  <section class="settings-section">
+    <h2>Storage</h2>
+
+    <label class="form-label">Maximum storage (GB)
+      <input id="input-storage" class="form-input" type="number"
+             min="1" max="500" step="0.5" value="{{ max_storage_gb }}" style="width:100px" />
+    </label>
+    <div class="hint">Oldest screenshots are deleted automatically when the limit is reached.</div>
+  </section>
+
+  <div class="form-actions">
+    <button id="btn-save-settings" class="btn-primary">Save settings</button>
+    <span id="save-status" class="save-status"></span>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  "use strict";
+
+  // ── Ollama status ──────────────────────────────────────────────────
+  async function checkOllamaStatus() {
+    const bar = document.getElementById("ollama-status-bar");
+    try {
+      const res  = await fetch("/api/status");
+      const data = await res.json();
+      if (data.ollama_available) {
+        bar.className   = "alert alert-success";
+        bar.textContent = "✓ Ollama is running and reachable.";
+      } else {
+        bar.className   = "alert alert-warning";
+        bar.textContent = `⚠ Ollama is not reachable at ${data.ollama_url}. Make sure it is running.`;
+      }
+    } catch (e) {
+      bar.className   = "alert alert-warning";
+      bar.textContent = "Could not reach the Dayflow server.";
+    }
+  }
+
+  // ── Model list ─────────────────────────────────────────────────────
+  document.getElementById("btn-refresh-models").addEventListener("click", async () => {
+    const list = document.getElementById("model-list");
+    list.style.display = "block";
+    list.textContent   = "Loading…";
+    try {
+      const res    = await fetch("/api/models");
+      const data   = await res.json();
+      const models = data.models || [];
+      if (models.length === 0) {
+        list.textContent = "No models found. Run `ollama pull llava` first.";
+      } else {
+        list.innerHTML = models
+          .map(
+            (m) =>
+              `<button class="model-chip" data-model="${escHtml(m)}">${escHtml(m)}</button>`
+          )
+          .join("");
+        list.querySelectorAll(".model-chip").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            document.getElementById("input-ollama-model").value = btn.dataset.model;
+          });
+        });
+      }
+    } catch (e) {
+      list.textContent = "Error loading models.";
+    }
+  });
+
+  // ── Save settings ──────────────────────────────────────────────────
+  document.getElementById("btn-save-settings").addEventListener("click", async () => {
+    const payload = {
+      ollama_url:     document.getElementById("input-ollama-url").value.trim(),
+      ollama_model:   document.getElementById("input-ollama-model").value.trim(),
+      capture_interval: parseInt(document.getElementById("input-interval").value, 10),
+      max_storage_gb:   parseFloat(document.getElementById("input-storage").value),
+    };
+
+    const statusEl = document.getElementById("save-status");
+    statusEl.textContent = "";
+
+    try {
+      const res = await fetch("/api/settings", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        statusEl.className   = "save-status save-ok";
+        statusEl.textContent = "✓ Saved";
+        checkOllamaStatus();
+      } else {
+        statusEl.className   = "save-status save-error";
+        statusEl.textContent = "Failed to save.";
+      }
+    } catch (e) {
+      statusEl.className   = "save-status save-error";
+      statusEl.textContent = "Network error.";
+    }
+    setTimeout(() => (statusEl.textContent = ""), 3000);
+  });
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  checkOllamaStatus();
+})();
+</script>
+{% endblock %}
