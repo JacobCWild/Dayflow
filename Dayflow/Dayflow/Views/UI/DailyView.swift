@@ -1,7 +1,7 @@
 import AppKit
-import CryptoKit
 import Foundation
 import SwiftUI
+import UserNotifications
 
 private let dailyTodayDisplayFormatter: DateFormatter = {
   let formatter = DateFormatter()
@@ -18,6 +18,12 @@ private let dailyOtherDayDisplayFormatter: DateFormatter = {
 private let dailyStandupSectionDayFormatter: DateFormatter = {
   let formatter = DateFormatter()
   formatter.dateFormat = "EEE, MMM d"
+  return formatter
+}()
+
+private let dailyStandupWeekdayFormatter: DateFormatter = {
+  let formatter = DateFormatter()
+  formatter.dateFormat = "EEEE"
   return formatter
 }()
 
@@ -38,6 +44,7 @@ private enum DailyStandupRegenerateState: Equatable {
   case idle
   case regenerating
   case regenerated
+  case noData
 }
 
 private struct DailyStandupSectionTitles {
@@ -46,21 +53,41 @@ private struct DailyStandupSectionTitles {
   let blockers: String
 }
 
+private struct DailyStandupDayInfo: Equatable, Sendable {
+  let dayString: String
+  let startOfDay: Date
+  let endOfDay: Date
+}
+
+private enum DailyAccessFlowStep {
+  case intro
+  case notifications
+  case provider
+}
+
 struct DailyView: View {
   @AppStorage("isDailyUnlocked") private var isUnlocked: Bool = false
   @Binding var selectedDate: Date
   @EnvironmentObject private var categoryStore: CategoryStore
-  @Environment(\.openURL) private var openURL
 
-  @State private var accessCode: String = ""
-  @State private var attempts: Int = 0
+  @State private var accessFlowStep: DailyAccessFlowStep = .intro
+  @State private var lockScreenConfettiTrigger: Int = 0
+  @State private var notificationAuthorizationStatus: UNAuthorizationStatus = .notDetermined
+  @State private var isCheckingNotificationAuthorization: Bool = false
+  @State private var isRequestingNotificationPermission: Bool = false
   @State private var workflowRows: [DailyWorkflowGridRow] = []
   @State private var workflowTotals: [DailyWorkflowTotalItem] = []
   @State private var workflowStats: [DailyWorkflowStatChip] = DailyWorkflowStatChip.placeholder
   @State private var workflowWindow: DailyWorkflowTimelineWindow = .placeholder
+  @State private var workflowDistractionMarkers: [DailyWorkflowDistractionMarker] = []
+  @State private var workflowHasDistractionCategory: Bool = false
+  @State private var workflowHoveredCellKey: String? = nil
+  @State private var workflowHoveredDistractionId: String? = nil
   @State private var workflowLoadTask: Task<Void, Never>? = nil
   @State private var standupDraft: DailyStandupDraft = .default
+  @State private var standupSourceDay: DailyStandupDayInfo? = nil
   @State private var loadedStandupDraftDay: String? = nil
+  @State private var loadedStandupFallbackSourceDay: String? = nil
   @State private var standupDraftSaveTask: Task<Void, Never>? = nil
   @State private var standupCopyState: DailyStandupCopyState = .idle
   @State private var standupCopyResetTask: Task<Void, Never>? = nil
@@ -69,16 +96,15 @@ struct DailyView: View {
   @State private var standupRegenerateResetTask: Task<Void, Never>? = nil
   @State private var standupRegeneratingDotsPhase: Int = 1
   @State private var hasPersistedStandupEntry: Bool = false
+  @State private var dailyRecapProvider: DailyRecapProvider = DailyRecapProvider.load()
+  @State private var isShowingProviderPicker: Bool = false
+  @State private var isRefreshingProviderAvailability: Bool = false
+  @State private var providerAvailabilityTask: Task<Void, Never>? = nil
+  @State private var providerAvailability: [DailyRecapProvider: DailyRecapProviderAvailability] =
+    [:]
 
-  private let requiredCodeHash = "6979ce2825cb3f440f987bbc487d62087c333abb99b56062c561ca557392d960"
   private let betaNoticeCopy =
     "Daily is a new way to visualize your day and turn it into a standup update fast."
-  private let onboardingNoticeCopy =
-    "Currently doing custom onboarding while we refine the workflow. If you’re interested, book some time and I’ll walk you through it."
-  private let onboardingBookingURL = "https://cal.com/jerry-liu/15min"
-  private let dayflowBackendDefaultEndpoint = "https://web-production-f3361.up.railway.app"
-  private let dayflowBackendInfoPlistKey = "DayflowBackendURL"
-  private let dayflowBackendOverrideDefaultsKey = "dayflowBackendURLOverride"
   private let priorStandupHistoryLimit = 3
   private static let maxDateTitleWidth: CGFloat = {
     let referenceText = "Wednesday, September 30"
@@ -99,169 +125,147 @@ struct DailyView: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     .environment(\.colorScheme, .light)
+    .onAppear {
+      dailyRecapProvider = DailyRecapGenerator.shared.selectedProvider()
+      refreshProviderAvailability()
+      checkNotificationAuthorizationForUnlock()
+    }
+    .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification))
+    { _ in
+      checkNotificationAuthorizationForUnlock()
+    }
+    .onChange(of: isUnlocked) { _, newValue in
+      guard !newValue else { return }
+      accessFlowStep = .intro
+      checkNotificationAuthorizationForUnlock()
+    }
   }
 
   private var lockScreen: some View {
-    VStack(spacing: 16) {
-      HStack(alignment: .top, spacing: 4) {
-        Text("Dayflow Daily")
-          .font(.custom("InstrumentSerif-Italic", size: 38))
-          .foregroundColor(Color(red: 0.35, green: 0.22, blue: 0.12))
+    ZStack {
+      dailyLockScreenBackground
 
-        Text("BETA")
-          .font(.custom("Nunito-Bold", size: 11))
-          .foregroundColor(.white)
-          .padding(.horizontal, 8)
-          .padding(.vertical, 4)
-          .background(
-            RoundedRectangle(cornerRadius: 6)
-              .fill(Color(red: 0.98, green: 0.55, blue: 0.20))
+      Group {
+        if accessFlowStep == .intro {
+          DailyAccessIntroView(
+            betaNoticeCopy: betaNoticeCopy,
+            onRequestAccess: startDailyAccessFlow,
+            onConfettiStart: triggerLockScreenConfetti
           )
-          .rotationEffect(.degrees(-12))
-          .offset(x: -4, y: -4)
+          .transition(.opacity.combined(with: .move(edge: .leading)))
+        } else if accessFlowStep == .notifications {
+          DailyNotificationOnboardingView(
+            notificationPermissionMessage: notificationPermissionMessage,
+            notificationPermissionButtonTitle: notificationPermissionButtonTitle,
+            isNotificationPermissionButtonDisabled: isNotificationPermissionButtonDisabled,
+            isNotificationRecheckButtonDisabled: isNotificationRecheckButtonDisabled,
+            onNotificationPermissionAction: handleNotificationPermissionAction,
+            onRecheckPermissions: checkNotificationAuthorizationForUnlock
+          )
+          .transition(.opacity.combined(with: .move(edge: .trailing)))
+        } else {
+          DailyProviderOnboardingView(
+            selectedProvider: dailyRecapProvider,
+            providerAvailability: providerAvailability,
+            isRefreshingProviderAvailability: isRefreshingProviderAvailability,
+            canContinue: canFinishDailyProviderOnboarding,
+            onSelectProvider: selectDailyRecapProvider,
+            onContinue: finishDailyProviderOnboarding
+          )
+          .transition(.opacity.combined(with: .move(edge: .trailing)))
+        }
       }
+      .padding(.horizontal, 24)
+      .padding(.vertical, 28)
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
 
-      Text(betaNoticeCopy)
-        .font(.custom("Nunito-Regular", size: 15))
-        .foregroundColor(Color(red: 0.35, green: 0.22, blue: 0.12).opacity(0.8))
-        .multilineTextAlignment(.center)
-        .frame(maxWidth: 480)
-        .padding(.horizontal, 24)
-
-      accessCodeCard
-        .modifier(Shake(animatableData: CGFloat(attempts)))
-        .padding(.top, 6)
-
-      VStack(spacing: 8) {
-        Text(onboardingNoticeCopy)
-          .font(.custom("Nunito-Regular", size: 13))
-          .foregroundColor(Color(red: 0.35, green: 0.22, blue: 0.12).opacity(0.75))
-          .multilineTextAlignment(.center)
-          .frame(maxWidth: 520)
-          .padding(.horizontal, 24)
-
-        DayflowSurfaceButton(
-          action: openManualOnboardingBooking,
-          content: {
-            HStack(spacing: 8) {
-              Image(systemName: "calendar")
-                .font(.system(size: 12, weight: .semibold))
-              Text("Book a Time")
-                .font(.custom("Nunito", size: 14))
-                .fontWeight(.semibold)
-            }
-          },
-          background: Color(red: 0.25, green: 0.17, blue: 0),
-          foreground: .white,
-          borderColor: .clear,
-          cornerRadius: 8,
-          horizontalPadding: 16,
-          verticalPadding: 10,
-          showOverlayStroke: true
-        )
-        .pointingHandCursor()
+      if lockScreenConfettiTrigger > 0 {
+        ConfettiBurstView(trigger: lockScreenConfettiTrigger)
+          .zIndex(10)
       }
     }
-    .padding(.horizontal, 24)
-    .padding(.vertical, 28)
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-    .background(
-      GeometryReader { geo in
-        Image("JournalPreview")
-          .resizable()
-          .scaledToFill()
-          .frame(width: geo.size.width, height: geo.size.height)
-          .clipped()
-          .allowsHitTesting(false)
-      }
-    )
+    .animation(.spring(response: 0.42, dampingFraction: 0.88), value: accessFlowStep)
   }
 
-  private var accessCodeCard: some View {
-    ZStack(alignment: .bottom) {
-      Image("JournalLock")
+  private var dailyLockScreenBackground: some View {
+    GeometryReader { geo in
+      Image("JournalPreview")
         .resizable()
-        .aspectRatio(contentMode: .fit)
-
-      VStack(spacing: 16) {
-        Text("Enter access code")
-          .font(.custom("Nunito-SemiBold", size: 20))
-          .foregroundColor(Color(red: 0.85, green: 0.45, blue: 0.25))
-
-        TextField("", text: $accessCode)
-          .textFieldStyle(.plain)
-          .font(.custom("Nunito-Medium", size: 15))
-          .foregroundColor(Color(red: 0.25, green: 0.15, blue: 0.10))
-          .multilineTextAlignment(.center)
-          .padding(.horizontal, 14)
-          .padding(.vertical, 12)
-          .background(
-            RoundedRectangle(cornerRadius: 8)
-              .fill(Color.white)
-          )
-          .padding(.horizontal, 80)
-          .submitLabel(.go)
-          .onSubmit { validateCode() }
-
-        Button(action: validateCode) {
-          Text("Get early access")
-            .font(.custom("Nunito-SemiBold", size: 15))
-            .foregroundColor(Color(red: 0.35, green: 0.22, blue: 0.12))
-            .padding(.horizontal, 28)
-            .padding(.vertical, 10)
-            .background(
-              Capsule()
-                .fill(
-                  LinearGradient(
-                    colors: [
-                      Color(red: 1.0, green: 0.92, blue: 0.82),
-                      Color(red: 1.0, green: 0.85, blue: 0.70),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                  )
-                )
-                .overlay(
-                  Capsule()
-                    .stroke(Color(red: 0.90, green: 0.75, blue: 0.55), lineWidth: 1)
-                )
-            )
-        }
-        .buttonStyle(.plain)
-        .pointingHandCursor()
-      }
-      .padding(.bottom, 28)
+        .scaledToFill()
+        .frame(width: geo.size.width, height: geo.size.height)
+        .clipped()
+        .allowsHitTesting(false)
     }
-    .frame(width: 380)
-    .shadow(color: Color.black.opacity(0.08), radius: 16, x: 0, y: 6)
+  }
+
+  private var isNotificationPermissionButtonDisabled: Bool {
+    isCheckingNotificationAuthorization || isRequestingNotificationPermission
+  }
+
+  private var isNotificationRecheckButtonDisabled: Bool {
+    isCheckingNotificationAuthorization || isRequestingNotificationPermission
+  }
+
+  private var canFinishDailyProviderOnboarding: Bool {
+    guard !(isRefreshingProviderAvailability && providerAvailability.isEmpty) else {
+      return false
+    }
+
+    return selectedProviderAvailability.isAvailable
+  }
+
+  private var selectedProviderAvailability: DailyRecapProviderAvailability {
+    providerAvailability[dailyRecapProvider]
+      ?? DailyRecapProviderAvailability(
+        isAvailable: true,
+        detail: dailyRecapProvider.pickerSubtitle
+      )
+  }
+
+  private var canRegenerateStandup: Bool {
+    dailyRecapProvider.canGenerate
+      && selectedProviderAvailability.isAvailable
+      && standupRegenerateState != .regenerating
+  }
+
+  private var regenerateButtonHelpText: String {
+    if !dailyRecapProvider.canGenerate {
+      return DailyStandupPlaceholder.noProviderSelectedMessage
+    }
+
+    if !selectedProviderAvailability.isAvailable {
+      return selectedProviderAvailability.detail
+    }
+
+    return "Regenerate standup highlights"
   }
 
   private var unlockedContent: some View {
     GeometryReader { geometry in
-      let baselineWidth: CGFloat = 950
       let maxLayoutWidth: CGFloat = 1320
       let availableWidth = max(320, geometry.size.width)
       let layoutWidth = min(availableWidth, maxLayoutWidth)
-      let scale = min(max(layoutWidth / baselineWidth, 0.82), 1.18)
+      let scale: CGFloat = 1.1
       let horizontalInset = 16 * scale
       let topInset = max(22, 20 * scale)
       let bottomInset = 16 * scale
       let sectionSpacing = 20 * scale
       let contentWidth = max(320, layoutWidth - (horizontalInset * 2))
-      let useSingleColumn = contentWidth < (840 * scale)
+      let useSingleColumn = false
       let isViewingToday = isTodaySelection(selectedDate)
 
       ScrollView(.vertical, showsIndicators: false) {
         VStack(alignment: .leading, spacing: sectionSpacing) {
           topControls(scale: scale)
           workflowSection(scale: scale, isViewingToday: isViewingToday)
-          actionRow(scale: scale, isViewingToday: isViewingToday)
+          actionRow(scale: scale)
           highlightsAndTasksSection(
             useSingleColumn: useSingleColumn,
             contentWidth: contentWidth,
             scale: scale,
-            titles: standupSectionTitles(for: selectedDate)
+            heading: standupSectionHeading(for: selectedDate),
+            titles: standupSectionTitles(for: selectedDate, sourceDay: standupSourceDay)
           )
         }
         .frame(width: contentWidth, alignment: .leading)
@@ -272,6 +276,8 @@ struct DailyView: View {
       }
     }
     .onAppear {
+      dailyRecapProvider = DailyRecapGenerator.shared.selectedProvider()
+      refreshProviderAvailability()
       refreshWorkflowData()
     }
     .onDisappear {
@@ -286,6 +292,8 @@ struct DailyView: View {
       standupRegenerateResetTask?.cancel()
       standupRegenerateResetTask = nil
       standupRegeneratingDotsPhase = 1
+      providerAvailabilityTask?.cancel()
+      providerAvailabilityTask = nil
     }
     .onChange(of: selectedDate) { _, _ in
       refreshWorkflowData()
@@ -297,40 +305,198 @@ struct DailyView: View {
       guard let dayString = notification.userInfo?["dayString"] as? String else {
         return
       }
-      if dayString == workflowDayString(for: selectedDate) {
+      if isRelevantTimelineDayUpdate(dayString, for: selectedDate) {
         refreshWorkflowData()
       }
     }
   }
 
-  private func validateCode() {
-    let inputLowercased = accessCode.lowercased()
-    let inputData = Data(inputLowercased.utf8)
-    let inputHash = SHA256.hash(data: inputData)
-    let inputHashString = inputHash.compactMap { String(format: "%02x", $0) }.joined()
+  private var notificationPermissionButtonTitle: String {
+    if isCheckingNotificationAuthorization || isRequestingNotificationPermission {
+      return "Checking..."
+    }
 
-    if inputHashString == requiredCodeHash {
-      AnalyticsService.shared.capture("daily_unlocked")
-      withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
-        isUnlocked = true
-      }
-    } else {
-      withAnimation(.default) {
-        attempts += 1
-        accessCode = ""
+    if notificationAuthorizationStatus == .authorized {
+      return "Opening Daily..."
+    }
+
+    if notificationAuthorizationStatus == .denied {
+      return "Open System Settings"
+    }
+
+    return "Turn on notifications"
+  }
+
+  private var notificationPermissionMessage: String {
+    if notificationAuthorizationStatus == .denied {
+      return
+        "Notifications are currently off for Dayflow. Enable them in System Settings to finish unlocking Daily."
+    }
+
+    if notificationAuthorizationStatus == .authorized {
+      return "Notifications are already enabled. We'll open Daily automatically."
+    }
+
+    return
+      "Turn them on to continue. If you come back from System Settings, we'll check automatically."
+  }
+
+  private func checkNotificationAuthorizationForUnlock() {
+    guard !isCheckingNotificationAuthorization, !isRequestingNotificationPermission else {
+      return
+    }
+
+    isCheckingNotificationAuthorization = true
+
+    Task {
+      let status = await NotificationService.shared.authorizationStatus()
+
+      await MainActor.run {
+        isCheckingNotificationAuthorization = false
+        notificationAuthorizationStatus = status
+
+        guard !isUnlocked else {
+          return
+        }
+
+        if canUnlockDaily(for: status) {
+          handleAuthorizedDailyAccessStatus()
+        }
       }
     }
   }
 
-  private func openManualOnboardingBooking() {
-    guard let url = URL(string: onboardingBookingURL) else { return }
+  private func handleNotificationPermissionAction() {
+    if notificationAuthorizationStatus == .authorized {
+      advanceToDailyProviderStep()
+    } else if notificationAuthorizationStatus == .denied {
+      openNotificationSettings()
+    } else {
+      requestNotificationPermissionForUnlock()
+    }
+  }
+
+  private func requestNotificationPermissionForUnlock() {
+    guard !isRequestingNotificationPermission else { return }
+    isRequestingNotificationPermission = true
+
+    Task {
+      let granted = await NotificationService.shared.requestPermission()
+      let status = await NotificationService.shared.authorizationStatus()
+
+      await MainActor.run {
+        isRequestingNotificationPermission = false
+        notificationAuthorizationStatus = status
+
+        if granted || canUnlockDaily(for: status) {
+          advanceToDailyProviderStep()
+        } else {
+          openNotificationSettings()
+        }
+      }
+    }
+  }
+
+  private func openNotificationSettings() {
+    let bundleID = Bundle.main.bundleIdentifier ?? "ai.dayflow.Dayflow"
+    let settingsURLString =
+      "x-apple.systempreferences:com.apple.preference.notifications?id=\(bundleID)"
+
+    if let settingsURL = URL(string: settingsURLString) {
+      _ = NSWorkspace.shared.open(settingsURL)
+      return
+    }
+
+    if let fallbackURL = URL(string: "x-apple.systempreferences:com.apple.preference.notifications")
+    {
+      _ = NSWorkspace.shared.open(fallbackURL)
+    }
+  }
+
+  private func completeDailyUnlock() {
+    AnalyticsService.shared.capture("daily_unlocked")
+
+    withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+      isUnlocked = true
+    }
+  }
+
+  private func canUnlockDaily(for status: UNAuthorizationStatus) -> Bool {
+    switch status {
+    case .authorized:
+      return true
+    case .provisional, .notDetermined, .denied:
+      return false
+    @unknown default:
+      return false
+    }
+  }
+
+  private func handleAuthorizedDailyAccessStatus() {
+    guard accessFlowStep == .notifications else {
+      return
+    }
+
+    advanceToDailyProviderStep()
+  }
+
+  private func advanceToDailyProviderStep() {
+    dailyRecapProvider = DailyRecapGenerator.shared.selectedProvider()
+    refreshProviderAvailability()
+
+    withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+      accessFlowStep = .provider
+    }
+  }
+
+  private func triggerLockScreenConfetti() {
+    lockScreenConfettiTrigger += 1
+  }
+
+  private func startDailyAccessFlow() {
     AnalyticsService.shared.capture(
-      "daily_manual_onboarding_booking_opened",
-      [
-        "source": "daily_lock_screen",
-        "url": onboardingBookingURL,
-      ])
-    openURL(url)
+      "daily_access_requested",
+      ["source": "daily_intro"]
+    )
+
+    refreshProviderAvailability()
+
+    withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+      accessFlowStep =
+        canUnlockDaily(for: notificationAuthorizationStatus) ? .provider : .notifications
+    }
+  }
+
+  private func finishDailyProviderOnboarding() {
+    guard canFinishDailyProviderOnboarding else {
+      return
+    }
+
+    prepareTodayDailyGenerationAfterUnlock()
+    completeDailyUnlock()
+
+    if dailyRecapProvider.canGenerate {
+      Task { @MainActor in
+        regenerateStandupFromTimeline()
+      }
+    }
+  }
+
+  private func prepareTodayDailyGenerationAfterUnlock() {
+    let today = Date()
+    selectedDate = today
+
+    standupRegenerateTask?.cancel()
+    standupRegenerateTask = nil
+    standupRegenerateResetTask?.cancel()
+    standupRegenerateResetTask = nil
+    standupRegenerateState = .idle
+    standupRegeneratingDotsPhase = 1
+    loadedStandupDraftDay = nil
+    loadedStandupFallbackSourceDay = nil
+    standupSourceDay = nil
+
+    refreshWorkflowData()
   }
 
   private func topControls(scale: CGFloat) -> some View {
@@ -411,7 +577,15 @@ struct DailyView: View {
       }
 
       VStack(spacing: 0) {
-        DailyWorkflowGrid(rows: workflowRows, timelineWindow: workflowWindow, scale: scale)
+        DailyWorkflowGrid(
+          rows: workflowRows,
+          timelineWindow: workflowWindow,
+          distractionMarkers: workflowDistractionMarkers,
+          showDistractionRow: workflowHasDistractionCategory,
+          scale: scale,
+          hoveredDistractionId: $workflowHoveredDistractionId,
+          hoveredCellKey: $workflowHoveredCellKey
+        )
 
         Divider()
           .overlay(Color(hex: "E5DFD9"))
@@ -428,8 +602,117 @@ struct DailyView: View {
       .overlay(
         RoundedRectangle(cornerRadius: 4, style: .continuous)
           .stroke(Color(hex: "E8E1DA"), lineWidth: max(0.7, 1 * scale))
+          .allowsHitTesting(false)
       )
+      .overlay(alignment: .topLeading) {
+        workflowTooltipOverlay(scale: scale)
+      }
     }
+  }
+
+  @ViewBuilder
+  private func workflowTooltipOverlay(scale: CGFloat) -> some View {
+    let layoutScale = scale
+    let topInset: CGFloat = 25 * layoutScale
+    let cellSize: CGFloat = 18 * layoutScale
+    let columnSpacing: CGFloat = 2 * layoutScale
+    let rowSpacing: CGFloat = 2 * layoutScale
+    let leftInset: CGFloat = 36 * layoutScale
+    let filteredRows =
+      workflowHasDistractionCategory
+      ? workflowRows.filter {
+        !isDistractionCategoryKey($0.id)
+      }
+      : workflowRows
+    let categoryLabelWidth = gridLabelColumnWidth(for: filteredRows, layoutScale: layoutScale)
+    let showDistractions = workflowHasDistractionCategory && !workflowDistractionMarkers.isEmpty
+    let distractionLabelWidth =
+      showDistractions
+      ? gridLabelColumnWidth(
+        for: [
+          DailyWorkflowGridRow(
+            id: "d", name: "Distractions", colorHex: "FF5950",
+            slotOccupancies: [], slotCardInfos: [])
+        ], layoutScale: layoutScale) : 0
+    let effectiveLabelWidth =
+      showDistractions
+      ? max(categoryLabelWidth, distractionLabelWidth) : categoryLabelWidth
+    let labelToGridSpacing: CGFloat = 13 * layoutScale
+    let gridLeadingOffset = leftInset + effectiveLabelWidth + labelToGridSpacing
+    let slotCount = max(
+      1, filteredRows.map { $0.slotOccupancies.count }.max() ?? workflowWindow.slotCount)
+    let gridWidth =
+      (cellSize * CGFloat(slotCount)) + (columnSpacing * CGFloat(max(0, slotCount - 1)))
+    let distractionRowSpacing: CGFloat = 6 * layoutScale
+    let gridRowsHeight =
+      (cellSize * CGFloat(filteredRows.count))
+      + (rowSpacing * CGFloat(max(0, filteredRows.count - 1)))
+
+    ZStack(alignment: .topLeading) {
+      Color.clear
+
+      // Cell tooltip — bottom-anchored so variable-height cards sit above the cell
+      if let cellKey = workflowHoveredCellKey {
+        let parts = cellKey.split(separator: "-")
+        if parts.count == 2,
+          let rowIndex = Int(parts[0]),
+          let slotIndex = Int(parts[1]),
+          rowIndex < filteredRows.count,
+          slotIndex < filteredRows[rowIndex].slotCardInfos.count,
+          let cardInfo = filteredRows[rowIndex].slotCardInfos[slotIndex]
+        {
+          let tooltipCenterX =
+            gridLeadingOffset + CGFloat(slotIndex) * (cellSize + columnSpacing) + cellSize / 2
+          let anchorY =
+            topInset + CGFloat(rowIndex) * (cellSize + rowSpacing) - (4 * layoutScale)
+
+          // Invisible anchor point at the cell's top edge
+          Color.clear
+            .frame(width: 1, height: 1)
+            .overlay(alignment: .bottom) {
+              workflowTooltip(
+                durationMinutes: cardInfo.durationMinutes,
+                title: cardInfo.title,
+                accentColor: Color(hex: "D77A43"),
+                layoutScale: layoutScale
+              )
+            }
+            .offset(x: tooltipCenterX, y: anchorY)
+        }
+      }
+
+      // Distraction tooltip — bottom-anchored above the distraction row
+      if showDistractions,
+        let hoveredId = workflowHoveredDistractionId,
+        let marker = workflowDistractionMarkers.first(where: { $0.id == hoveredId })
+      {
+        let totalMinutes = workflowWindow.endMinute - workflowWindow.startMinute
+        let startFraction =
+          (marker.startMinute - workflowWindow.startMinute) / totalMinutes
+        let endFraction = (marker.endMinute - workflowWindow.startMinute) / totalMinutes
+        let xPos = CGFloat(startFraction) * gridWidth
+        let markerWidth = max(
+          3 * layoutScale, CGFloat(endFraction - startFraction) * gridWidth)
+        let tooltipCenterX = gridLeadingOffset + xPos + markerWidth / 2
+        let anchorY =
+          topInset + gridRowsHeight + distractionRowSpacing - (4 * layoutScale)
+
+        Color.clear
+          .frame(width: 1, height: 1)
+          .overlay(alignment: .bottom) {
+            workflowTooltip(
+              durationMinutes: marker.endMinute - marker.startMinute,
+              title: marker.title,
+              accentColor: Color(hex: "FF5950"),
+              layoutScale: layoutScale
+            )
+          }
+          .offset(x: tooltipCenterX, y: anchorY)
+      }
+    }
+    .animation(.easeOut(duration: 0.12), value: workflowHoveredCellKey)
+    .animation(.easeOut(duration: 0.12), value: workflowHoveredDistractionId)
+    .allowsHitTesting(false)
   }
 
   private func workflowTotalsView(scale: CGFloat, isViewingToday: Bool) -> some View {
@@ -468,18 +751,16 @@ struct DailyView: View {
   }
 
   @ViewBuilder
-  private func actionRow(scale: CGFloat, isViewingToday: Bool) -> some View {
+  private func actionRow(scale: CGFloat) -> some View {
     let actionButtons = HStack(spacing: 10 * scale) {
       if hasPersistedStandupEntry {
         standupCopyButton(scale: scale)
       }
-      if !isViewingToday {
-        standupRegenerateButton(scale: scale)
-      }
+      standupRegenerateButton(scale: scale)
+      dailyProviderButton(scale: scale)
     }
 
     HStack {
-      // TODO: Bring back the Highlights/Details toggle when Details mode is ready.
       Spacer(minLength: 0)
       actionButtons
     }
@@ -562,6 +843,10 @@ struct DailyView: View {
             Image(systemName: "checkmark")
               .font(.system(size: 12 * scale, weight: .semibold))
               .transition(transition)
+          } else if standupRegenerateState == .noData {
+            Image(systemName: "exclamationmark.circle")
+              .font(.system(size: 12 * scale, weight: .semibold))
+              .transition(transition)
           } else {
             Image(systemName: "arrow.clockwise")
               .font(.system(size: 12 * scale, weight: .semibold))
@@ -574,12 +859,12 @@ struct DailyView: View {
           Text(regenerateButtonLabel)
             .font(.custom("Nunito-Medium", size: 14 * scale))
             .lineLimit(1)
-            .opacity(standupRegenerateState == .regenerated ? 0 : 1)
+            .opacity(transientRegenerateButtonLabel == nil ? 1 : 0)
 
-          Text("Regenerated")
+          Text(transientRegenerateButtonLabel ?? "")
             .font(.custom("Nunito-Medium", size: 14 * scale))
             .lineLimit(1)
-            .opacity(standupRegenerateState == .regenerated ? 1 : 0)
+            .opacity(transientRegenerateButtonLabel == nil ? 0 : 1)
         }
         .frame(minWidth: 108 * scale, alignment: .leading)
       }
@@ -605,17 +890,189 @@ struct DailyView: View {
     }
     .buttonStyle(DailyCopyPressButtonStyle())
     .animation(.easeInOut(duration: 0.22), value: standupRegenerateState)
-    .disabled(standupRegenerateState == .regenerating)
+    .disabled(!canRegenerateStandup)
     .pointingHandCursorOnHover(
-      enabled: standupRegenerateState != .regenerating, reassertOnPressEnd: true
+      enabled: canRegenerateStandup, reassertOnPressEnd: true
     )
     .accessibilityLabel(Text("Regenerate standup highlights"))
-    .onReceive(Timer.publish(every: 0.45, on: .main, in: .common).autoconnect()) { _ in
-      guard standupRegenerateState == .regenerating else {
-        standupRegeneratingDotsPhase = 1
-        return
+    .help(regenerateButtonHelpText)
+    .background {
+      if standupRegenerateState == .regenerating {
+        Color.clear
+          .onReceive(Timer.publish(every: 0.45, on: .main, in: .common).autoconnect()) { _ in
+            standupRegeneratingDotsPhase = (standupRegeneratingDotsPhase % 3) + 1
+          }
       }
-      standupRegeneratingDotsPhase = (standupRegeneratingDotsPhase % 3) + 1
+    }
+    .onChange(of: standupRegenerateState) {
+      if standupRegenerateState != .regenerating {
+        standupRegeneratingDotsPhase = 1
+      }
+    }
+  }
+
+  private func dailyProviderButton(scale: CGFloat) -> some View {
+    Button {
+      if !isShowingProviderPicker {
+        refreshProviderAvailability()
+      }
+      isShowingProviderPicker.toggle()
+    } label: {
+      ZStack {
+        Circle()
+          .fill(Color(hex: "F7F3F1"))
+
+        Circle()
+          .stroke(Color(hex: "E4D7D0"), lineWidth: max(1.1, 1.3 * scale))
+
+        Image(systemName: "gearshape.fill")
+          .font(.system(size: 13 * scale, weight: .semibold))
+          .foregroundStyle(Color(hex: "B46531"))
+      }
+      .frame(width: 38 * scale, height: 38 * scale)
+      .shadow(color: Color.black.opacity(0.03), radius: 5, x: 0, y: 2)
+      .contentShape(Circle())
+    }
+    .buttonStyle(DailyCopyPressButtonStyle())
+    .disabled(standupRegenerateState == .regenerating)
+    .pointingHandCursorOnHover(
+      enabled: standupRegenerateState != .regenerating,
+      reassertOnPressEnd: true
+    )
+    .accessibilityLabel(Text("Choose daily recap provider"))
+    .help("Daily recap provider: \(dailyRecapProvider.selectionLabel)")
+    .popover(isPresented: $isShowingProviderPicker, arrowEdge: .bottom) {
+      dailyProviderPicker(scale: scale)
+        .padding(16)
+        .frame(width: 312)
+        .environment(\.colorScheme, .light)
+        .preferredColorScheme(.light)
+    }
+  }
+
+  private func dailyProviderPicker(scale: CGFloat) -> some View {
+    VStack(alignment: .leading, spacing: 12 * scale) {
+      HStack(alignment: .firstTextBaseline) {
+        VStack(alignment: .leading, spacing: 2 * scale) {
+          Text("Daily recap provider")
+            .font(.custom("InstrumentSerif-Regular", size: 22 * scale))
+            .foregroundStyle(Color(hex: "2E221B"))
+
+          Text("Choose how Daily generates this recap, or turn generation off.")
+            .font(.custom("Nunito-Regular", size: 12 * scale))
+            .foregroundStyle(Color(hex: "8B6B59"))
+        }
+
+        Spacer(minLength: 0)
+
+        if isRefreshingProviderAvailability {
+          ProgressView()
+            .controlSize(.small)
+            .tint(Color(hex: "B46531"))
+        }
+      }
+
+      VStack(spacing: 8 * scale) {
+        ForEach(DailyRecapProvider.allCases, id: \.self) { provider in
+          let availability =
+            providerAvailability[provider]
+            ?? DailyRecapProviderAvailability(isAvailable: true, detail: provider.pickerSubtitle)
+          let isSelected = dailyRecapProvider == provider
+
+          Button {
+            selectDailyRecapProvider(provider)
+          } label: {
+            HStack(alignment: .top, spacing: 10 * scale) {
+              VStack(alignment: .leading, spacing: 2 * scale) {
+                Text(provider.displayName)
+                  .font(.custom("Nunito-SemiBold", size: 13 * scale))
+                  .foregroundStyle(Color(hex: isSelected ? "8F522C" : "2F241D"))
+
+                Text(availability.detail)
+                  .font(.custom("Nunito-Regular", size: 12 * scale))
+                  .foregroundStyle(Color(hex: availability.isAvailable ? "8B6B59" : "B07A74"))
+                  .multilineTextAlignment(.leading)
+              }
+
+              Spacer(minLength: 0)
+
+              Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 14 * scale, weight: .semibold))
+                .foregroundStyle(
+                  isSelected ? Color(hex: "C96F3A") : Color(hex: "D3C6BE")
+                )
+            }
+            .padding(.horizontal, 12 * scale)
+            .padding(.vertical, 10 * scale)
+            .background(
+              RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                .fill(
+                  isSelected
+                    ? Color(hex: "FFF4EC")
+                    : Color(hex: "FAF8F7")
+                )
+            )
+            .overlay(
+              RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                .stroke(
+                  isSelected ? Color(hex: "EBC4AB") : Color(hex: "E8E1DC"),
+                  lineWidth: max(1, 1.2 * scale)
+                )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 14 * scale, style: .continuous))
+          }
+          .buttonStyle(.plain)
+          .disabled(!availability.isAvailable)
+          .pointingHandCursorOnHover(enabled: availability.isAvailable, reassertOnPressEnd: true)
+        }
+      }
+    }
+  }
+
+  private func selectDailyRecapProvider(_ provider: DailyRecapProvider) {
+    let previousProvider = dailyRecapProvider
+    guard previousProvider != provider else {
+      isShowingProviderPicker = false
+      return
+    }
+
+    dailyRecapProvider = provider
+    DailyRecapGenerator.shared.persistSelectedProvider(provider)
+    isShowingProviderPicker = false
+    standupRegenerateResetTask?.cancel()
+    standupRegenerateResetTask = nil
+    standupRegenerateState = .idle
+    loadedStandupDraftDay = nil
+    loadedStandupFallbackSourceDay = nil
+
+    AnalyticsService.shared.capture(
+      "daily_provider_selected",
+      [
+        "previous_daily_provider": previousProvider.analyticsName,
+        "previous_daily_provider_label": previousProvider.displayName,
+        "daily_provider": provider.analyticsName,
+        "daily_provider_label": provider.displayName,
+        "daily_runtime": provider.runtimeLabel,
+        "daily_model_or_tool": provider.modelOrTool as Any,
+      ]
+    )
+
+    refreshWorkflowData()
+  }
+
+  private func refreshProviderAvailability() {
+    providerAvailabilityTask?.cancel()
+    isRefreshingProviderAvailability = true
+
+    providerAvailabilityTask = Task.detached(priority: .utility) {
+      let snapshot = DailyRecapGenerator.shared.availabilitySnapshot()
+      guard !Task.isCancelled else { return }
+
+      await MainActor.run {
+        providerAvailability = snapshot
+        isRefreshingProviderAvailability = false
+        providerAvailabilityTask = nil
+      }
     }
   }
 
@@ -624,55 +1081,62 @@ struct DailyView: View {
     useSingleColumn: Bool,
     contentWidth: CGFloat,
     scale: CGFloat,
+    heading: String,
     titles: DailyStandupSectionTitles
   ) -> some View {
-    if useSingleColumn {
-      VStack(alignment: .leading, spacing: 12 * scale) {
-        DailyBulletCard(
-          style: .highlights,
-          seamMode: .standalone,
-          title: titles.highlights,
-          items: $standupDraft.highlights,
-          blockersTitle: $standupDraft.blockersTitle,
-          blockersBody: $standupDraft.blockersBody,
-          scale: scale
-        )
-        DailyBulletCard(
-          style: .tasks,
-          seamMode: .standalone,
-          title: titles.tasks,
-          items: $standupDraft.tasks,
-          blockersTitle: $standupDraft.blockersTitle,
-          blockersBody: $standupDraft.blockersBody,
-          scale: scale
-        )
-      }
-    } else {
-      // Figma overlaps borders by ~1px to avoid a visible gutter.
-      let cardSpacing = -1 * scale
-      let cardWidth = (contentWidth - cardSpacing) / 2
-      HStack(alignment: .top, spacing: cardSpacing) {
-        DailyBulletCard(
-          style: .highlights,
-          seamMode: .joinedLeading,
-          title: titles.highlights,
-          items: $standupDraft.highlights,
-          blockersTitle: $standupDraft.blockersTitle,
-          blockersBody: $standupDraft.blockersBody,
-          scale: scale
-        )
-        .frame(width: cardWidth)
+    VStack(alignment: .leading, spacing: 8 * scale) {
+      Text(heading)
+        .font(.custom("InstrumentSerif-Regular", size: 24 * scale))
+        .foregroundStyle(Color(hex: "B46531"))
 
-        DailyBulletCard(
-          style: .tasks,
-          seamMode: .joinedTrailing,
-          title: titles.tasks,
-          items: $standupDraft.tasks,
-          blockersTitle: $standupDraft.blockersTitle,
-          blockersBody: $standupDraft.blockersBody,
-          scale: scale
-        )
-        .frame(width: cardWidth)
+      if useSingleColumn {
+        VStack(alignment: .leading, spacing: 12 * scale) {
+          DailyBulletCard(
+            style: .highlights,
+            seamMode: .standalone,
+            title: titles.highlights,
+            items: $standupDraft.highlights,
+            blockersTitle: $standupDraft.blockersTitle,
+            blockersBody: $standupDraft.blockersBody,
+            scale: scale
+          )
+          DailyBulletCard(
+            style: .tasks,
+            seamMode: .standalone,
+            title: titles.tasks,
+            items: $standupDraft.tasks,
+            blockersTitle: $standupDraft.blockersTitle,
+            blockersBody: $standupDraft.blockersBody,
+            scale: scale
+          )
+        }
+      } else {
+        // Figma overlaps borders by ~1px to avoid a visible gutter.
+        let cardSpacing = -1 * scale
+        let cardWidth = (contentWidth - cardSpacing) / 2
+        HStack(alignment: .top, spacing: cardSpacing) {
+          DailyBulletCard(
+            style: .highlights,
+            seamMode: .joinedLeading,
+            title: titles.highlights,
+            items: $standupDraft.highlights,
+            blockersTitle: $standupDraft.blockersTitle,
+            blockersBody: $standupDraft.blockersBody,
+            scale: scale
+          )
+          .frame(width: cardWidth)
+
+          DailyBulletCard(
+            style: .tasks,
+            seamMode: .joinedTrailing,
+            title: titles.tasks,
+            items: $standupDraft.tasks,
+            blockersTitle: $standupDraft.blockersTitle,
+            blockersBody: $standupDraft.blockersBody,
+            scale: scale
+          )
+          .frame(width: cardWidth)
+        }
       }
     }
   }
@@ -681,13 +1145,18 @@ struct DailyView: View {
     workflowLoadTask?.cancel()
     workflowLoadTask = nil
 
-    let dayString = workflowDayString(for: selectedDate)
-    refreshStandupDraftIfNeeded(for: dayString)
+    let workflowDay = workflowDayInfo(for: selectedDate)
+    let resolvedStandupSourceDay = resolveStandupSourceDay(for: workflowDay)
+    standupSourceDay = resolvedStandupSourceDay
+    refreshStandupDraftIfNeeded(
+      storageDayString: workflowDay.dayString,
+      sourceDay: resolvedStandupSourceDay
+    )
 
     let categorySnapshot = categoryStore.categories
 
     workflowLoadTask = Task.detached(priority: .userInitiated) {
-      let cards = StorageManager.shared.fetchTimelineCards(forDay: dayString)
+      let cards = StorageManager.shared.fetchTimelineCards(forDay: workflowDay.dayString)
       let computed = computeDailyWorkflow(cards: cards, categories: categorySnapshot)
 
       guard !Task.isCancelled else { return }
@@ -697,6 +1166,8 @@ struct DailyView: View {
         workflowTotals = computed.totals
         workflowStats = computed.stats
         workflowWindow = computed.window
+        workflowDistractionMarkers = computed.distractionMarkers
+        workflowHasDistractionCategory = computed.hasDistractionCategory
       }
     }
   }
@@ -735,35 +1206,64 @@ struct DailyView: View {
   }
 
   private func regenerateStandupFromTimeline() {
-    guard !isTodaySelection(selectedDate) else { return }
     guard standupRegenerateState != .regenerating else { return }
     let regenerateRunId = UUID().uuidString
 
-    let timelineDate = timelineDisplayDate(from: selectedDate)
-    let dayInfo = timelineDate.getDayInfoFor4AMBoundary()
-    let dayString = dayInfo.dayString
-    let dayStartTs = Int(dayInfo.startOfDay.timeIntervalSince1970)
-    let dayEndTs = Int(dayInfo.endOfDay.timeIntervalSince1970)
-    let standupTitles = standupSectionTitles(for: selectedDate)
+    let targetDay = workflowDayInfo(for: selectedDate)
+    let storageDayString = targetDay.dayString
+    let selectedProvider = dailyRecapProvider
+    let usesDayflowInputs = selectedProvider.usesDayflowInputs
+
+    guard selectedProvider.canGenerate else {
+      standupDraft = .noProviderSelected
+      standupRegenerateState = .idle
+      return
+    }
+    let providerProps: [String: Any] = [
+      "daily_provider": selectedProvider.analyticsName,
+      "daily_provider_label": selectedProvider.displayName,
+      "daily_runtime": selectedProvider.runtimeLabel,
+      "daily_model_or_tool": selectedProvider.modelOrTool as Any,
+    ]
+    guard let sourceDayInfo = standupSourceDay ?? resolveStandupSourceDay(for: targetDay) else {
+      standupRegenerateState = .noData
+      AnalyticsService.shared.capture(
+        "daily_generation_failed",
+        providerProps.merging(
+          [
+            "timeline_day": storageDayString,
+            "source": "regenerate_button",
+            "reason": "not_enough_recent_activity",
+          ],
+          uniquingKeysWith: { _, new in new }
+        ))
+      scheduleStandupRegenerateReset()
+      return
+    }
+
+    let dayString = sourceDayInfo.dayString
+    let dayStartTs = Int(sourceDayInfo.startOfDay.timeIntervalSince1970)
+    let dayEndTs = Int(sourceDayInfo.endOfDay.timeIntervalSince1970)
+    let standupTitles = standupSectionTitles(for: selectedDate, sourceDay: sourceDayInfo)
     let currentHighlightsTitle = standupTitles.highlights
     let currentTasksTitle = standupTitles.tasks
     let currentBlockersTitle = standupTitles.blockers
-    let preferencesText = currentPreferencesText(titles: standupTitles)
-    let priorStandupLimit = priorStandupHistoryLimit
-    let defaultEndpoint = dayflowBackendDefaultEndpoint
-    let infoPlistKey = dayflowBackendInfoPlistKey
-    let overrideDefaultsKey = dayflowBackendOverrideDefaultsKey
 
     standupRegenerateTask?.cancel()
     standupRegenerateResetTask?.cancel()
 
     AnalyticsService.shared.capture(
       "daily_standup_regenerate_clicked",
-      [
-        "timeline_day": dayString,
-        "source": "regenerate_button",
-      ])
-    print("[Daily] Regenerate started run_id=\(regenerateRunId) day=\(dayString)")
+      providerProps.merging(
+        [
+          "timeline_day": storageDayString,
+          "source": "regenerate_button",
+        ],
+        uniquingKeysWith: { _, new in new }
+      ))
+    print(
+      "[Daily] Regenerate started run_id=\(regenerateRunId) day=\(dayString) provider=\(selectedProvider.analyticsName) model=\(selectedProvider.modelOrTool ?? "default")"
+    )
 
     standupRegenerateState = .regenerating
 
@@ -775,99 +1275,83 @@ struct DailyView: View {
         print(
           "[Daily] Regenerate failed run_id=\(regenerateRunId) day=\(dayString) reason=no_cards")
         await MainActor.run {
-          standupRegenerateState = .idle
+          standupRegenerateState = .noData
           standupRegenerateTask = nil
           AnalyticsService.shared.capture(
             "daily_generation_failed",
-            [
-              "timeline_day": dayString,
-              "source": "regenerate_button",
-              "reason": "no_cards",
-            ])
+            providerProps.merging(
+              [
+                "timeline_day": storageDayString,
+                "source": "regenerate_button",
+                "reason": "no_cards",
+              ],
+              uniquingKeysWith: { _, new in new }
+            ))
+          scheduleStandupRegenerateReset()
         }
         return
       }
 
-      let observations = StorageManager.shared.fetchObservations(
-        startTs: dayStartTs, endTs: dayEndTs)
-      let priorEntries = StorageManager.shared.fetchRecentDailyStandups(
-        limit: priorStandupLimit,
-        excludingDay: dayString
-      )
-      let cardsText = Self.makeCardsText(day: dayString, cards: cards)
-      let observationsText = Self.makeObservationsText(day: dayString, observations: observations)
-      let priorDailyText = Self.makePriorDailyText(entries: priorEntries)
+      let observations =
+        usesDayflowInputs
+        ? StorageManager.shared.fetchObservations(startTs: dayStartTs, endTs: dayEndTs) : []
+      let priorEntries =
+        usesDayflowInputs
+        ? StorageManager.shared.fetchRecentDailyStandups(
+          limit: priorStandupHistoryLimit,
+          excludingDay: dayString
+        ) : []
+      let cardsText = DailyRecapGenerator.makeCardsText(day: dayString, cards: cards)
+      let observationsText =
+        usesDayflowInputs
+        ? DailyRecapGenerator.makeObservationsText(day: dayString, observations: observations)
+        : ""
+      let priorDailyText =
+        usesDayflowInputs ? DailyRecapGenerator.makePriorDailyText(entries: priorEntries) : ""
+      let preferencesText =
+        usesDayflowInputs
+        ? DailyRecapGenerator.makePreferencesText(
+          highlightsTitle: currentHighlightsTitle,
+          tasksTitle: currentTasksTitle,
+          blockersTitle: currentBlockersTitle
+        ) : ""
 
       AnalyticsService.shared.capture(
         "daily_generation_payload_built",
-        [
-          "timeline_day": dayString,
-          "source": "regenerate_button",
-          "cards_count": cards.count,
-          "observations_count": observations.count,
-          "prior_daily_count": priorEntries.count,
-          "cards_text_chars": cardsText.count,
-          "observations_text_chars": observationsText.count,
-          "prior_daily_text_chars": priorDailyText.count,
-          "preferences_text_chars": preferencesText.count,
-        ])
+        providerProps.merging(
+          [
+            "timeline_day": dayString,
+            "source": "regenerate_button",
+            "input_mode": usesDayflowInputs ? "cards_observations_prior" : "cards_only",
+            "cards_count": cards.count,
+            "observations_count": observations.count,
+            "prior_daily_count": priorEntries.count,
+            "cards_text_chars": cardsText.count,
+            "observations_text_chars": observationsText.count,
+            "prior_daily_text_chars": priorDailyText.count,
+            "preferences_text_chars": preferencesText.count,
+          ],
+          uniquingKeysWith: { _, new in new }
+        ))
       print(
         "[Daily] Regenerate payload run_id=\(regenerateRunId) day=\(dayString) "
-          + "cards=\(cards.count) observations=\(observations.count) prior_daily=\(priorEntries.count)"
-      )
-
-      guard
-        let provider = Self.makeDayflowBackendProvider(
-          defaultEndpoint: defaultEndpoint,
-          infoPlistKey: infoPlistKey,
-          overrideDefaultsKey: overrideDefaultsKey,
-          debugRunId: regenerateRunId
-        )
-      else {
-        guard !Task.isCancelled else { return }
-        print(
-          "[Daily] Regenerate failed run_id=\(regenerateRunId) day=\(dayString) "
-            + "reason=missing_dayflow_token"
-        )
-        await MainActor.run {
-          standupRegenerateState = .idle
-          standupRegenerateTask = nil
-          AnalyticsService.shared.capture(
-            "daily_generation_failed",
-            [
-              "timeline_day": dayString,
-              "source": "regenerate_button",
-              "reason": "missing_dayflow_token",
-            ])
-        }
-        return
-      }
-
-      let request = DayflowDailyGenerationRequest(
-        day: dayString,
-        cardsText: cardsText,
-        observationsText: observationsText,
-        priorDailyText: priorDailyText,
-        preferencesText: preferencesText
+          + "cards=\(cards.count) observations=\(observations.count) prior_daily=\(priorEntries.count) input_mode=\(usesDayflowInputs ? "cards_observations_prior" : "cards_only")"
       )
 
       do {
-        let response = try await provider.generateDaily(request)
-        let highlights = Self.normalizedBullets(from: response.highlights)
-        let unfinished = Self.normalizedBullets(from: response.unfinished)
-        let blockers = Self.normalizedBlockersText(from: response.blockers)
-        let regeneratedDraft = DailyStandupDraft(
+        let context = DailyRecapGenerationContext(
+          targetDayString: storageDayString,
+          sourceDayString: dayString,
+          cards: cards,
+          observations: observations,
+          priorEntries: priorEntries,
           highlightsTitle: currentHighlightsTitle,
-          highlights: highlights,
           tasksTitle: currentTasksTitle,
-          tasks: unfinished,
-          blockersTitle: currentBlockersTitle,
-          blockersBody: blockers
+          blockersTitle: currentBlockersTitle
         )
+        let regeneratedDraft = try await DailyRecapGenerator.shared.generate(context: context)
 
-        guard let payloadData = try? JSONEncoder().encode(regeneratedDraft),
-          let payloadJSON = String(data: payloadData, encoding: .utf8)
-        else {
+        guard let payloadJSON = regeneratedDraft.encodedJSONString() else {
           guard !Task.isCancelled else { return }
           print(
             "[Daily] Regenerate failed run_id=\(regenerateRunId) day=\(dayString) "
@@ -878,62 +1362,69 @@ struct DailyView: View {
             standupRegenerateTask = nil
             AnalyticsService.shared.capture(
               "daily_generation_failed",
-              [
-                "timeline_day": dayString,
-                "source": "regenerate_button",
-                "reason": "encode_failed",
-              ])
+              providerProps.merging(
+                [
+                  "timeline_day": storageDayString,
+                  "source": "regenerate_button",
+                  "reason": "encode_failed",
+                ],
+                uniquingKeysWith: { _, new in new }
+              ))
           }
           return
         }
 
-        StorageManager.shared.saveDailyStandup(forDay: dayString, payloadJSON: payloadJSON)
+        StorageManager.shared.saveDailyStandup(forDay: storageDayString, payloadJSON: payloadJSON)
 
         guard !Task.isCancelled else { return }
         let latencyMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+        let blockersCount = regeneratedDraft.blockersBody
+          .split(whereSeparator: \.isNewline)
+          .count
         print(
-          "[Daily] Regenerate succeeded run_id=\(regenerateRunId) day=\(dayString) cards=\(cards.count) observations=\(observations.count) highlights=\(highlights.count) tasks=\(unfinished.count) blockers=\(response.blockers.count) latency_ms=\(latencyMs)"
+          "[Daily] Regenerate succeeded run_id=\(regenerateRunId) day=\(dayString) cards=\(cards.count) observations=\(observations.count) highlights=\(regeneratedDraft.highlights.count) tasks=\(regeneratedDraft.tasks.count) blockers=\(blockersCount) latency_ms=\(latencyMs)"
         )
 
         await MainActor.run {
           standupDraft = regeneratedDraft
-          loadedStandupDraftDay = dayString
+          loadedStandupDraftDay = storageDayString
+          loadedStandupFallbackSourceDay = sourceDayInfo.dayString
+          standupSourceDay = sourceDayInfo
           hasPersistedStandupEntry = true
           standupRegenerateTask = nil
           standupRegenerateState = .regenerated
 
           AnalyticsService.shared.capture(
             "daily_standup_regenerated",
-            [
-              "timeline_day": dayString,
-              "highlights_count": highlights.count,
-              "tasks_count": unfinished.count,
-              "blockers_count": response.blockers.count,
-            ])
+            providerProps.merging(
+              [
+                "timeline_day": storageDayString,
+                "highlights_count": regeneratedDraft.highlights.count,
+                "tasks_count": regeneratedDraft.tasks.count,
+                "blockers_count": blockersCount,
+              ],
+              uniquingKeysWith: { _, new in new }
+            ))
           AnalyticsService.shared.capture(
             "daily_generation_succeeded",
-            [
-              "timeline_day": dayString,
-              "source": "regenerate_button",
-              "highlights_count": highlights.count,
-              "tasks_count": unfinished.count,
-              "blockers_count": response.blockers.count,
-              "latency_ms": latencyMs,
-            ])
+            providerProps.merging(
+              [
+                "timeline_day": storageDayString,
+                "source": "regenerate_button",
+                "highlights_count": regeneratedDraft.highlights.count,
+                "tasks_count": regeneratedDraft.tasks.count,
+                "blockers_count": blockersCount,
+                "latency_ms": latencyMs,
+              ],
+              uniquingKeysWith: { _, new in new }
+            ))
           print(
             "[Daily] Regenerate notification enqueue run_id=\(regenerateRunId) "
-              + "day=\(dayString)"
+              + "day=\(storageDayString)"
           )
-          NotificationService.shared.scheduleDailyRecapReadyNotification(forDay: dayString)
+          NotificationService.shared.scheduleDailyRecapReadyNotification(forDay: storageDayString)
 
-          standupRegenerateResetTask = Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-              standupRegenerateState = .idle
-              standupRegenerateResetTask = nil
-            }
-          }
+          scheduleStandupRegenerateReset()
         }
       } catch {
         let nsError = error as NSError
@@ -946,226 +1437,26 @@ struct DailyView: View {
           standupRegenerateTask = nil
           AnalyticsService.shared.capture(
             "daily_generation_failed",
-            [
-              "timeline_day": dayString,
-              "source": "regenerate_button",
-              "reason": "api_error",
-              "error_domain": nsError.domain,
-              "error_code": nsError.code,
-              "error_message": String(nsError.localizedDescription.prefix(500)),
-            ])
+            providerProps.merging(
+              [
+                "timeline_day": storageDayString,
+                "source": "regenerate_button",
+                "reason": "api_error",
+                "error_domain": nsError.domain,
+                "error_code": nsError.code,
+                "error_message": String(nsError.localizedDescription.prefix(500)),
+              ],
+              uniquingKeysWith: { _, new in new }
+            ))
         }
       }
     }
   }
 
-  nonisolated private static func makeCardsText(day: String, cards: [TimelineCard]) -> String {
-    let ordered = cards.sorted { lhs, rhs in
-      if lhs.startTimestamp == rhs.startTimestamp {
-        return lhs.endTimestamp < rhs.endTimestamp
-      }
-      return lhs.startTimestamp < rhs.startTimestamp
-    }
-
-    guard !ordered.isEmpty else {
-      return "No timeline activities were recorded for \(day)."
-    }
-
-    var lines: [String] = ["Timeline activities for \(day):", ""]
-    for (index, card) in ordered.enumerated() {
-      let title = standupLine(from: card) ?? "Untitled activity"
-      let start = humanReadableClockTime(card.startTimestamp)
-      let end = humanReadableClockTime(card.endTimestamp)
-      lines.append("\(index + 1). \(start) - \(end): \(title)")
-
-      let summary = card.summary.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !summary.isEmpty, summary != title {
-        lines.append("   \(summary)")
-      }
-    }
-
-    return lines.joined(separator: "\n")
-  }
-
-  nonisolated private static func makeObservationsText(day: String, observations: [Observation])
-    -> String
-  {
-    guard !observations.isEmpty else {
-      return "No observations were recorded for \(day)."
-    }
-
-    let ordered = observations.sorted { $0.startTs < $1.startTs }
-    var lines: [String] = ["Observations for \(day):", ""]
-
-    for observation in ordered {
-      let body = observation.observation.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !body.isEmpty else { continue }
-      let start = humanReadableClockTime(unixTimestamp: observation.startTs)
-      let end = humanReadableClockTime(unixTimestamp: observation.endTs)
-      lines.append("\(start) - \(end): \(body)")
-    }
-
-    if lines.count <= 2 {
-      return "No observations were recorded for \(day)."
-    }
-    return lines.joined(separator: "\n")
-  }
-
-  nonisolated private static func makePriorDailyText(entries: [DailyStandupEntry]) -> String {
-    guard !entries.isEmpty else { return "" }
-
-    return entries.map { entry in
-      let payload = entry.payloadJSON.trimmingCharacters(in: .whitespacesAndNewlines)
-      return """
-        Day \(entry.standupDay):
-        \(payload)
-        """
-    }
-    .joined(separator: "\n\n")
-  }
-
-  private func currentPreferencesText(titles: DailyStandupSectionTitles) -> String {
-    let preferences: [String: String] = [
-      "highlights_title": titles.highlights,
-      "tasks_title": titles.tasks,
-      "blockers_title": titles.blockers,
-    ]
-
-    guard
-      let jsonData = try? JSONSerialization.data(
-        withJSONObject: preferences, options: [.sortedKeys]),
-      let jsonString = String(data: jsonData, encoding: .utf8)
-    else {
-      return ""
-    }
-    return jsonString
-  }
-
-  nonisolated private static func makeDayflowBackendProvider(
-    defaultEndpoint: String,
-    infoPlistKey: String,
-    overrideDefaultsKey: String,
-    debugRunId: String
-  ) -> DayflowBackendProvider? {
-    let token = AnalyticsService.shared.backendAuthToken()
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !token.isEmpty else {
-      print(
-        "[Daily] Provider resolve failed run_id=\(debugRunId) reason=empty_backend_auth_token"
-      )
-      return nil
-    }
-    print(
-      "[Daily] Provider auth token run_id=\(debugRunId) id=\(token) length=\(token.count)"
-    )
-
-    let endpoint = resolvedDayflowEndpoint(
-      defaultEndpoint: defaultEndpoint,
-      infoPlistKey: infoPlistKey,
-      overrideDefaultsKey: overrideDefaultsKey,
-      debugRunId: debugRunId
-    )
-    print("[Daily] Provider endpoint run_id=\(debugRunId) endpoint=\(endpoint)")
-    return DayflowBackendProvider(token: token, endpoint: endpoint)
-  }
-
-  nonisolated private static func resolvedDayflowEndpoint(
-    defaultEndpoint: String,
-    infoPlistKey: String,
-    overrideDefaultsKey: String,
-    debugRunId: String
-  ) -> String {
-    let defaults = UserDefaults.standard
-
-    if let override = defaults.string(forKey: overrideDefaultsKey)?
-      .trimmingCharacters(in: .whitespacesAndNewlines),
-      !override.isEmpty
-    {
-      print(
-        "[Daily] Endpoint resolved run_id=\(debugRunId) source=user_defaults_override value=\(override)"
-      )
-      return override
-    }
-
-    if let infoEndpoint = Bundle.main.infoDictionary?[infoPlistKey] as? String {
-      let trimmed = infoEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmed.isEmpty {
-        print(
-          "[Daily] Endpoint resolved run_id=\(debugRunId) source=info_plist value=\(trimmed)"
-        )
-        return trimmed
-      }
-    }
-
-    if case .dayflowBackend(let savedEndpoint) = LLMProviderType.load(from: defaults) {
-      let trimmed = savedEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmed.isEmpty {
-        print(
-          "[Daily] Endpoint resolved run_id=\(debugRunId) source=provider_settings value=\(trimmed)"
-        )
-        return trimmed
-      }
-    }
-
-    print(
-      "[Daily] Endpoint resolved run_id=\(debugRunId) source=default value=\(defaultEndpoint)"
-    )
-    return defaultEndpoint
-  }
-
-  nonisolated private static func normalizedBullets(from values: [String]) -> [DailyBulletItem] {
-    var seen: Set<String> = []
-    return values.compactMap { raw in
-      let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !trimmed.isEmpty else { return nil }
-      guard seen.insert(trimmed).inserted else { return nil }
-      return DailyBulletItem(text: trimmed)
-    }
-  }
-
-  nonisolated private static func normalizedBlockersText(from values: [String]) -> String {
-    let rows = values.compactMap { value -> String? in
-      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-      return trimmed.isEmpty ? nil : trimmed
-    }
-    return rows.joined(separator: "\n")
-  }
-
-  nonisolated private static func humanReadableClockTime(_ input: String) -> String {
-    let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let minuteOfDay = parseTimeHMMA(timeString: trimmed) else {
-      return trimmed.lowercased()
-    }
-
-    let hour24 = (minuteOfDay / 60) % 24
-    let minute = minuteOfDay % 60
-    let meridiem = hour24 >= 12 ? "pm" : "am"
-    let hour12 = hour24 % 12 == 0 ? 12 : hour24 % 12
-    return String(format: "%d:%02d%@", hour12, minute, meridiem)
-  }
-
-  nonisolated private static func humanReadableClockTime(unixTimestamp: Int) -> String {
-    let date = Date(timeIntervalSince1970: TimeInterval(unixTimestamp))
-    let calendar = Calendar.current
-    let hour24 = calendar.component(.hour, from: date)
-    let minute = calendar.component(.minute, from: date)
-    let meridiem = hour24 >= 12 ? "pm" : "am"
-    let hour12 = hour24 % 12 == 0 ? 12 : hour24 % 12
-    return String(format: "%d:%02d%@", hour12, minute, meridiem)
-  }
-
-  nonisolated private static func standupLine(from card: TimelineCard) -> String? {
-    let trimmedTitle = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !trimmedTitle.isEmpty {
-      return trimmedTitle
-    }
-
-    let trimmedSummary = card.summary.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmedSummary.isEmpty ? nil : trimmedSummary
-  }
-
   private func standupClipboardText(for date: Date) -> String {
-    let titles = standupSectionTitles(for: date)
+    let targetDay = workflowDayInfo(for: date)
+    let sourceDay = resolveStandupSourceDay(for: targetDay)
+    let titles = standupSectionTitles(for: date, sourceDay: sourceDay)
     let yesterdayItems = sanitizedStandupItems(standupDraft.highlights)
     let todayItems = sanitizedStandupItems(standupDraft.tasks)
     let blockersItems = sanitizedBlockers(standupDraft.blockersBody)
@@ -1223,24 +1514,63 @@ struct DailyView: View {
     else {
       return nil
     }
+    guard
+      trimmed.caseInsensitiveCompare(DailyStandupPlaceholder.insufficientHistoryMessage)
+        != .orderedSame
+    else {
+      return nil
+    }
+    guard
+      trimmed.caseInsensitiveCompare(DailyStandupPlaceholder.noProviderSelectedMessage)
+        != .orderedSame
+    else {
+      return nil
+    }
     return trimmed
   }
 
-  private func refreshStandupDraftIfNeeded(for dayString: String) {
-    let entry = StorageManager.shared.fetchDailyStandup(forDay: dayString)
+  private func refreshStandupDraftIfNeeded(
+    storageDayString: String,
+    sourceDay: DailyStandupDayInfo?
+  ) {
+    let fallbackSourceDayString = sourceDay?.dayString
+    let isSameDraftDay = loadedStandupDraftDay == storageDayString
+    let isSameFallbackSourceDay = loadedStandupFallbackSourceDay == fallbackSourceDayString
+    let entry = StorageManager.shared.fetchDailyStandup(forDay: storageDayString)
     hasPersistedStandupEntry = entry != nil
 
-    guard loadedStandupDraftDay != dayString else { return }
-    loadedStandupDraftDay = dayString
+    if dailyRecapProvider == .none, entry == nil {
+      guard !isSameDraftDay || !isSameFallbackSourceDay || standupDraft != .noProviderSelected
+      else {
+        return
+      }
 
-    guard let entry,
-      let data = entry.payloadJSON.data(using: .utf8),
-      let decoded = try? JSONDecoder().decode(DailyStandupDraft.self, from: data)
-    else {
-      standupDraft = defaultStandupDraft(for: dayString)
+      loadedStandupDraftDay = storageDayString
+      loadedStandupFallbackSourceDay = fallbackSourceDayString
+      standupDraft = .noProviderSelected
       return
     }
 
+    if entry != nil {
+      guard !isSameDraftDay else { return }
+    } else {
+      guard !isSameDraftDay || !isSameFallbackSourceDay else { return }
+    }
+
+    loadedStandupDraftDay = storageDayString
+    loadedStandupFallbackSourceDay = fallbackSourceDayString
+
+    guard let entry,
+      let data = entry.payloadJSON.data(using: .utf8),
+      var decoded = try? JSONDecoder().decode(DailyStandupDraft.self, from: data)
+    else {
+      standupDraft = placeholderStandupDraft(sourceDay: sourceDay)
+      return
+    }
+
+    if decoded.generation == nil {
+      decoded.generation = .legacyDayflow
+    }
     standupDraft = decoded
   }
 
@@ -1254,10 +1584,14 @@ struct DailyView: View {
       guard !Task.isCancelled else { return }
 
       let existing = StorageManager.shared.fetchDailyStandup(forDay: dayString)
-      let todayDayString = Date().getDayInfoFor4AMBoundary().dayString
-      let placeholderDraft =
-        dayString == todayDayString ? DailyStandupDraft.todayPlaceholder : DailyStandupDraft.default
-      if existing == nil && draftToSave == placeholderDraft {
+      let placeholderDrafts: [DailyStandupDraft] = [
+        .default,
+        .insufficientHistory,
+      ]
+      if draftToSave == .noProviderSelected {
+        return
+      }
+      if existing == nil && placeholderDrafts.contains(draftToSave) {
         return
       }
 
@@ -1277,18 +1611,115 @@ struct DailyView: View {
   }
 
   private func workflowDayString(for date: Date) -> String {
-    let anchorDate = timelineDisplayDate(from: date)
-    return anchorDate.getDayInfoFor4AMBoundary().dayString
+    workflowDayInfo(for: date).dayString
   }
 
-  private func defaultStandupDraft(for dayString: String) -> DailyStandupDraft {
-    let todayDayString = Date().getDayInfoFor4AMBoundary().dayString
-    return dayString == todayDayString ? .todayPlaceholder : .default
+  private func isRelevantTimelineDayUpdate(_ updatedDayString: String, for date: Date) -> Bool {
+    let targetDay = workflowDayInfo(for: date)
+    guard updatedDayString != targetDay.dayString else { return true }
+
+    let calendar = Calendar.current
+    for offset in 1...3 {
+      guard
+        let candidateDate = calendar.date(byAdding: .day, value: -offset, to: targetDay.startOfDay)
+      else {
+        continue
+      }
+
+      if DateFormatter.yyyyMMdd.string(from: candidateDate) == updatedDayString {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  private func workflowDayInfo(for date: Date) -> DailyStandupDayInfo {
+    let anchorDate = timelineDisplayDate(from: date)
+    let dayInfo = anchorDate.getDayInfoFor4AMBoundary()
+    return DailyStandupDayInfo(
+      dayString: dayInfo.dayString,
+      startOfDay: dayInfo.startOfDay,
+      endOfDay: dayInfo.endOfDay
+    )
+  }
+
+  private func resolveStandupSourceDay(for targetDay: DailyStandupDayInfo) -> DailyStandupDayInfo? {
+    let calendar = Calendar.current
+    let minimumMinutes = 120
+
+    for offset in 1...3 {
+      guard
+        let sourceStart = calendar.date(byAdding: .day, value: -offset, to: targetDay.startOfDay)
+      else {
+        continue
+      }
+
+      let sourceDayString = DateFormatter.yyyyMMdd.string(from: sourceStart)
+      let hasEnoughActivity = StorageManager.shared.hasMinimumTimelineActivity(
+        forDay: sourceDayString,
+        minimumMinutes: minimumMinutes
+      )
+
+      guard hasEnoughActivity,
+        let sourceEnd = calendar.date(byAdding: .day, value: 1, to: sourceStart)
+      else {
+        continue
+      }
+
+      return DailyStandupDayInfo(
+        dayString: sourceDayString,
+        startOfDay: sourceStart,
+        endOfDay: sourceEnd
+      )
+    }
+
+    return nil
+  }
+
+  private func placeholderStandupDraft(sourceDay: DailyStandupDayInfo?) -> DailyStandupDraft {
+    if dailyRecapProvider == .none {
+      return .noProviderSelected
+    }
+
+    if sourceDay == nil {
+      return .insufficientHistory
+    }
+
+    return .default
   }
 
   private var regenerateButtonLabel: String {
-    guard standupRegenerateState == .regenerating else { return "Regenerate" }
-    return "Regenerating" + String(repeating: ".", count: standupRegeneratingDotsPhase)
+    switch standupRegenerateState {
+    case .regenerating:
+      return "Regenerating" + String(repeating: ".", count: standupRegeneratingDotsPhase)
+    case .idle, .regenerated, .noData:
+      return "Regenerate"
+    }
+  }
+
+  private var transientRegenerateButtonLabel: String? {
+    switch standupRegenerateState {
+    case .regenerated:
+      return "Regenerated"
+    case .noData:
+      return "No data"
+    case .idle, .regenerating:
+      return nil
+    }
+  }
+
+  private func scheduleStandupRegenerateReset() {
+    standupRegenerateResetTask?.cancel()
+    standupRegenerateResetTask = Task {
+      try? await Task.sleep(nanoseconds: 2_000_000_000)
+      guard !Task.isCancelled else { return }
+
+      await MainActor.run {
+        standupRegenerateState = .idle
+        standupRegenerateResetTask = nil
+      }
+    }
   }
 
   private func shiftDate(by days: Int) {
@@ -1306,35 +1737,63 @@ struct DailyView: View {
     return dailyOtherDayDisplayFormatter.string(from: displayDate)
   }
 
-  private func standupSectionTitles(for date: Date) -> DailyStandupSectionTitles {
+  private func standupSectionTitles(for date: Date, sourceDay: DailyStandupDayInfo?)
+    -> DailyStandupSectionTitles
+  {
+    let targetDay = workflowDayInfo(for: date)
+    return DailyStandupSectionTitles(
+      highlights: standupHighlightsTitle(for: sourceDay),
+      tasks: standupTasksTitle(for: targetDay),
+      blockers: "Blockers"
+    )
+  }
+
+  private func standupSectionHeading(for date: Date) -> String {
+    "Standup for \(dailyDateTitle(for: date))"
+  }
+
+  private func standupHighlightsTitle(for sourceDay: DailyStandupDayInfo?) -> String {
+    guard let sourceDay else { return "Recent highlights" }
+
+    let label = standupDayLabelText(for: sourceDay.startOfDay)
+    if label == "Today" || label == "Yesterday" || label.hasPrefix("Last ") {
+      return "\(label)'s highlights"
+    }
+    return "Highlights from \(label)"
+  }
+
+  private func standupTasksTitle(for targetDay: DailyStandupDayInfo) -> String {
+    let label = standupDayLabelText(for: targetDay.startOfDay)
+    if label == "Today" || label == "Yesterday" {
+      return "\(label)'s tasks"
+    }
+    return "Tasks for \(label)"
+  }
+
+  private func standupDayLabelText(for date: Date) -> String {
     let calendar = Calendar.current
-    let displayDate = timelineDisplayDate(from: date)
+    let displayDate = normalizedTimelineDate(date)
     let timelineToday = timelineDisplayDate(from: Date())
 
     if calendar.isDate(displayDate, inSameDayAs: timelineToday) {
-      return DailyStandupSectionTitles(
-        highlights: "Today's highlights",
-        tasks: "Tomorrow's tasks",
-        blockers: "Blockers"
-      )
+      return "Today"
     }
 
-    let timelineYesterday =
-      calendar.date(byAdding: .day, value: -1, to: timelineToday) ?? timelineToday
+    guard let timelineYesterday = calendar.date(byAdding: .day, value: -1, to: timelineToday)
+    else {
+      return dailyOtherDayDisplayFormatter.string(from: displayDate)
+    }
+
     if calendar.isDate(displayDate, inSameDayAs: timelineYesterday) {
-      return DailyStandupSectionTitles(
-        highlights: "Yesterday's highlights",
-        tasks: "Today's tasks",
-        blockers: "Blockers"
-      )
+      return "Yesterday"
     }
 
-    let nextDate = calendar.date(byAdding: .day, value: 1, to: displayDate) ?? displayDate
-    return DailyStandupSectionTitles(
-      highlights: "Highlights from \(dailyStandupSectionDayFormatter.string(from: displayDate))",
-      tasks: "Tasks for \(dailyStandupSectionDayFormatter.string(from: nextDate))",
-      blockers: "Blockers"
-    )
+    let daysAgo = calendar.dateComponents([.day], from: displayDate, to: timelineToday).day ?? 99
+    if (2...6).contains(daysAgo) {
+      return "Last \(dailyStandupWeekdayFormatter.string(from: displayDate))"
+    }
+
+    return dailyOtherDayDisplayFormatter.string(from: displayDate)
   }
 
   private func workflowTotalsTitle(for date: Date) -> String {
@@ -1350,13 +1809,7 @@ struct DailyView: View {
   }
 
   private func formatDuration(minutes: Double) -> String {
-    let rounded = max(0, Int(minutes.rounded()))
-    let hours = rounded / 60
-    let mins = rounded % 60
-
-    if hours > 0 && mins > 0 { return "\(hours)h \(mins)m" }
-    if hours > 0 { return "\(hours)h" }
-    return "\(mins)m"
+    formatDurationValue(minutes)
   }
 }
 
@@ -1371,11 +1824,22 @@ private struct DailyCopyPressButtonStyle: ButtonStyle {
 private struct DailyWorkflowGrid: View {
   let rows: [DailyWorkflowGridRow]
   let timelineWindow: DailyWorkflowTimelineWindow
+  let distractionMarkers: [DailyWorkflowDistractionMarker]
+  let showDistractionRow: Bool
   let scale: CGFloat
+
+  @Binding var hoveredDistractionId: String?
+  @Binding var hoveredCellKey: String?
 
   private var renderRows: [DailyWorkflowGridRow] {
     if rows.isEmpty {
       return DailyWorkflowGridRow.placeholderRows(slotCount: timelineWindow.slotCount)
+    }
+    // Hide the Distraction/Distractions category row when we have a dedicated distractions row
+    if showDistractionRow {
+      return rows.filter {
+        !isDistractionCategoryKey($0.id)
+      }
     }
     return rows
   }
@@ -1395,8 +1859,24 @@ private struct DailyWorkflowGrid: View {
       let axisTopSpacing: CGFloat = 10 * layoutScale
       let axisLabelSpacing: CGFloat = 5 * layoutScale
 
+      let distractionRowHeight: CGFloat = 10 * layoutScale
+      let distractionRowSpacing: CGFloat = 6 * layoutScale
+      let distractionCornerRadius: CGFloat = max(1, 2 * layoutScale)
+      let showDistractions = showDistractionRow && !distractionMarkers.isEmpty
+      let distractionLabelWidth =
+        showDistractions
+        ? labelColumnWidth(
+          for: [
+            DailyWorkflowGridRow(
+              id: "d", name: "Distractions", colorHex: "FF5950",
+              slotOccupancies: [], slotCardInfos: [])
+          ], layoutScale: layoutScale) : 0
+      let effectiveLabelWidth =
+        showDistractions
+        ? max(categoryLabelWidth, distractionLabelWidth) : categoryLabelWidth
+
       let gridViewportWidth = max(
-        80, geo.size.width - leftInset - categoryLabelWidth - labelToGridSpacing - rightInset)
+        80, geo.size.width - leftInset - effectiveLabelWidth - labelToGridSpacing - rightInset)
       let baselineCellSize: CGFloat = 18 * layoutScale
       let baselineGap: CGFloat = 2 * layoutScale
       let cellSize = baselineCellSize
@@ -1416,28 +1896,92 @@ private struct DailyWorkflowGrid: View {
               Text(row.name)
                 .font(.custom("Nunito-Regular", size: categoryLabelFontSize))
                 .foregroundStyle(Color.black.opacity(0.9))
-                .frame(width: categoryLabelWidth, height: cellSize, alignment: .trailing)
+                .frame(width: effectiveLabelWidth, height: cellSize, alignment: .trailing)
+            }
+            if showDistractions {
+              Text("Distractions")
+                .font(.custom("Nunito-Regular", size: categoryLabelFontSize))
+                .foregroundStyle(Color.black.opacity(0.9))
+                .frame(
+                  width: effectiveLabelWidth, height: distractionRowHeight, alignment: .trailing
+                )
+                .padding(.top, distractionRowSpacing - rowSpacing)
             }
           }
           .padding(.top, topInset)
 
           ScrollView(.horizontal, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 0) {
+              // Grid rows
               VStack(alignment: .leading, spacing: rowSpacing) {
-                ForEach(renderRows) { row in
+                ForEach(Array(renderRows.enumerated()), id: \.element.id) { rowIndex, row in
                   HStack(spacing: columnSpacing) {
-                    ForEach(0..<slotCount, id: \.self) { index in
+                    ForEach(0..<slotCount, id: \.self) { slotIndex in
+                      let cellKey = "\(rowIndex)-\(slotIndex)"
                       Rectangle()
                         .foregroundStyle(.clear)
-                        .background(fillColor(for: row, slotIndex: index))
+                        .background(fillColor(for: row, slotIndex: slotIndex))
                         .cornerRadius(cellCornerRadius)
                         .frame(width: cellSize, height: cellSize)
+                        .onHover { hovering in
+                          if hovering {
+                            hoveredCellKey = cellKey
+                            hoveredDistractionId = nil
+                          } else if hoveredCellKey == cellKey {
+                            hoveredCellKey = nil
+                          }
+                        }
                     }
                   }
                   .frame(width: gridWidth, alignment: .leading)
                 }
               }
               .padding(.top, topInset)
+
+              // Distractions row — continuous markers with proper hit areas
+              if showDistractions {
+                let totalMinutes = timelineWindow.endMinute - timelineWindow.startMinute
+
+                ZStack(alignment: .topLeading) {
+                  // Background track
+                  Rectangle()
+                    .fill(Color(red: 0.95, green: 0.93, blue: 0.92))
+                    .cornerRadius(distractionCornerRadius)
+                    .frame(width: gridWidth, height: distractionRowHeight)
+
+                  // Markers — each in its own HStack for correct hit-testing
+                  ForEach(distractionMarkers) { marker in
+                    let startFraction =
+                      (marker.startMinute - timelineWindow.startMinute) / totalMinutes
+                    let endFraction = (marker.endMinute - timelineWindow.startMinute) / totalMinutes
+                    let leadingPad = CGFloat(startFraction) * gridWidth
+                    let markerWidth = max(
+                      3 * layoutScale, CGFloat(endFraction - startFraction) * gridWidth)
+
+                    HStack(spacing: 0) {
+                      Color.clear.frame(width: leadingPad, height: distractionRowHeight)
+                      Rectangle()
+                        .fill(Color(hex: "FF5950"))
+                        .opacity(hoveredDistractionId == marker.id ? 1.0 : 0.85)
+                        .cornerRadius(distractionCornerRadius)
+                        .frame(width: markerWidth, height: distractionRowHeight)
+                        .contentShape(Rectangle())
+                        .onHover { hovering in
+                          if hovering {
+                            hoveredDistractionId = marker.id
+                            hoveredCellKey = nil
+                          } else if hoveredDistractionId == marker.id {
+                            hoveredDistractionId = nil
+                          }
+                        }
+                      Spacer(minLength: 0)
+                    }
+                    .frame(width: gridWidth, height: distractionRowHeight)
+                  }
+                }
+                .frame(width: gridWidth, height: distractionRowHeight)
+                .padding(.top, distractionRowSpacing)
+              }
 
               VStack(alignment: .leading, spacing: axisLabelSpacing) {
                 Rectangle()
@@ -1493,22 +2037,30 @@ private struct DailyWorkflowGrid: View {
       .padding(.leading, leftInset)
       .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
-    .frame(height: contentHeight(for: renderRows.count, layoutScale: scale))
+    .frame(
+      height: contentHeight(
+        for: renderRows.count, layoutScale: scale,
+        includeDistractionRow: showDistractionRow && !distractionMarkers.isEmpty)
+    )
   }
 
-  private func contentHeight(for rowCount: Int, layoutScale: CGFloat) -> CGFloat {
+  private func contentHeight(
+    for rowCount: Int, layoutScale: CGFloat, includeDistractionRow: Bool = false
+  ) -> CGFloat {
     let rows = max(1, rowCount)
     let topInset: CGFloat = 25 * layoutScale
     let cell: CGFloat = 18 * layoutScale
     let gap: CGFloat = 2 * layoutScale
     let rowsHeight = (cell * CGFloat(rows)) + (gap * CGFloat(max(0, rows - 1)))
+    let distractionHeight: CGFloat =
+      includeDistractionRow ? (6 * layoutScale) + (10 * layoutScale) : 0
     let axisTopSpacing: CGFloat = 10 * layoutScale
     let axisLineHeight: CGFloat = max(0.7, 0.9 * layoutScale)
     let axisLabelSpacing: CGFloat = 5 * layoutScale
     let axisLabelHeight: CGFloat = 14 * layoutScale
     let bottomBuffer: CGFloat = 6 * layoutScale
-    return topInset + rowsHeight + axisTopSpacing + axisLineHeight + axisLabelSpacing
-      + axisLabelHeight + bottomBuffer
+    return topInset + rowsHeight + distractionHeight + axisTopSpacing + axisLineHeight
+      + axisLabelSpacing + axisLabelHeight + bottomBuffer
   }
 
   private func fillColor(for row: DailyWorkflowGridRow, slotIndex: Int) -> Color {
@@ -1540,18 +2092,59 @@ private struct DailyWorkflowGrid: View {
   }
 
   private func labelColumnWidth(for rows: [DailyWorkflowGridRow], layoutScale: CGFloat) -> CGFloat {
-    let fontSize = 12 * layoutScale
-    let font =
-      NSFont(name: "Nunito-Regular", size: fontSize)
-      ?? NSFont.systemFont(ofSize: fontSize, weight: .regular)
-    let measuredMax = rows.reduce(CGFloat.zero) { currentMax, row in
-      let width = (row.name as NSString).size(withAttributes: [.font: font]).width
-      return max(currentMax, width)
-    }
-
-    // Keep the label column as tight as possible while avoiding text clipping.
-    return ceil(measuredMax + 1)
+    gridLabelColumnWidth(for: rows, layoutScale: layoutScale)
   }
+
+}
+
+// MARK: - Shared tooltip builders and grid helpers
+
+private func gridLabelColumnWidth(
+  for rows: [DailyWorkflowGridRow], layoutScale: CGFloat
+) -> CGFloat {
+  let fontSize = 12 * layoutScale
+  let font =
+    NSFont(name: "Nunito-Regular", size: fontSize)
+    ?? NSFont.systemFont(ofSize: fontSize, weight: .regular)
+  let measuredMax = rows.reduce(CGFloat.zero) { currentMax, row in
+    let width = (row.name as NSString).size(withAttributes: [.font: font]).width
+    return max(currentMax, width)
+  }
+  return ceil(measuredMax + 1)
+}
+
+@ViewBuilder
+private func workflowTooltip(
+  durationMinutes: Double,
+  title: String,
+  accentColor: Color,
+  layoutScale: CGFloat
+) -> some View {
+  VStack(alignment: .leading, spacing: 4 * layoutScale) {
+    Text(formatDurationValue(durationMinutes))
+      .font(.custom("Nunito-SemiBold", size: 12 * layoutScale))
+      .foregroundStyle(accentColor)
+    Text(title)
+      .font(.custom("Nunito-Regular", size: 12 * layoutScale))
+      .foregroundStyle(Color.black)
+      .fixedSize(horizontal: false, vertical: true)
+  }
+  .padding(8 * layoutScale)
+  .frame(width: 200 * layoutScale, alignment: .leading)
+  .background(tooltipBackground(layoutScale: layoutScale))
+  .allowsHitTesting(false)
+}
+
+@ViewBuilder
+private func tooltipBackground(layoutScale: CGFloat) -> some View {
+  RoundedRectangle(cornerRadius: 4, style: .continuous)
+    .fill(Color.white)
+    .overlay(
+      RoundedRectangle(cornerRadius: 4, style: .continuous)
+        .stroke(Color(hex: "EDE0CE"), lineWidth: 1)
+    )
+    .shadow(
+      color: Color(red: 1, green: 0.63, blue: 0.54).opacity(0.25), radius: 2, x: 0, y: 2)
 }
 
 private struct DailyStatChip: View {
@@ -2045,9 +2638,9 @@ private struct DailyListDropToEndDelegate: DropDelegate {
   }
 }
 
-private struct DailyBulletItem: Identifiable, Codable, Equatable, Sendable {
-  var id: UUID = UUID()
-  var text: String
+private struct DailyWorkflowSlotCardInfo: Sendable {
+  let title: String
+  let durationMinutes: Double
 }
 
 private struct DailyWorkflowGridRow: Identifiable, Sendable {
@@ -2055,6 +2648,7 @@ private struct DailyWorkflowGridRow: Identifiable, Sendable {
   let name: String
   let colorHex: String
   let slotOccupancies: [Double]
+  let slotCardInfos: [DailyWorkflowSlotCardInfo?]
 
   static func placeholderRows(slotCount: Int) -> [DailyWorkflowGridRow] {
     DailyGridConfig.fallbackCategoryNames.enumerated().map { index, name in
@@ -2063,7 +2657,8 @@ private struct DailyWorkflowGridRow: Identifiable, Sendable {
         name: name,
         colorHex: DailyGridConfig.fallbackColorHexes[
           index % DailyGridConfig.fallbackColorHexes.count],
-        slotOccupancies: Array(repeating: 0, count: max(1, slotCount))
+        slotOccupancies: Array(repeating: 0, count: max(1, slotCount)),
+        slotCardInfos: Array(repeating: nil, count: max(1, slotCount))
       )
     }
   }
@@ -2076,11 +2671,20 @@ private struct DailyWorkflowTotalItem: Identifiable, Sendable {
   let colorHex: String
 }
 
+private struct DailyWorkflowDistractionMarker: Identifiable, Sendable {
+  let id: String
+  let title: String
+  let startMinute: Double
+  let endMinute: Double
+}
+
 private struct DailyWorkflowComputationResult: Sendable {
   let rows: [DailyWorkflowGridRow]
   let totals: [DailyWorkflowTotalItem]
   let stats: [DailyWorkflowStatChip]
   let window: DailyWorkflowTimelineWindow
+  let distractionMarkers: [DailyWorkflowDistractionMarker]
+  let hasDistractionCategory: Bool
 }
 
 private struct DailyWorkflowSegment: Sendable {
@@ -2090,6 +2694,8 @@ private struct DailyWorkflowSegment: Sendable {
   let startMinute: Double
   let endMinute: Double
   let hasDistraction: Bool
+  let cardTitle: String
+  let cardDurationMinutes: Double
 }
 
 private struct DailyWorkflowStatChip: Identifiable, Sendable {
@@ -2148,15 +2754,14 @@ private func computeDailyWorkflow(cards: [TimelineCard], categories: [TimelineCa
     .sorted { $0.order < $1.order }
     .filter { normalizedCategoryKey($0.name) != systemCategoryKey }
 
-  let colorMap: [String: String] = Dictionary(
-    uniqueKeysWithValues: orderedCategories.map {
-      (normalizedCategoryKey($0.name), normalizedHex($0.colorHex))
-    })
-
-  let nameMap: [String: String] = Dictionary(
-    uniqueKeysWithValues: orderedCategories.map {
-      (normalizedCategoryKey($0.name), $0.name.trimmingCharacters(in: .whitespacesAndNewlines))
-    })
+  let categoryLookup = firstCategoryLookup(
+    from: orderedCategories,
+    normalizedKey: normalizedCategoryKey
+  )
+  let colorMap = categoryLookup.mapValues { normalizedHex($0.colorHex) }
+  let nameMap = categoryLookup.mapValues {
+    $0.name.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
 
   struct RawDailyWorkflowSegment {
     let categoryKey: String
@@ -2165,6 +2770,8 @@ private func computeDailyWorkflow(cards: [TimelineCard], categories: [TimelineCa
     let startMinute: Double
     let endMinute: Double
     let hasDistraction: Bool
+    let cardTitle: String
+    let cardDurationMinutes: Double
   }
 
   var rawSegments: [RawDailyWorkflowSegment] = []
@@ -2177,9 +2784,9 @@ private func computeDailyWorkflow(cards: [TimelineCard], categories: [TimelineCa
       continue
     }
 
-    if startMinute < 240 { startMinute += 1440 }
-    if endMinute < 240 { endMinute += 1440 }
-    if endMinute <= startMinute { endMinute += 1440 }
+    let normalized = normalizedMinuteRange(start: startMinute, end: endMinute)
+    startMinute = normalized.start
+    endMinute = normalized.end
 
     let trimmed = card.category.trimmingCharacters(in: .whitespacesAndNewlines)
     let displayName = trimmed.isEmpty ? "Uncategorized" : trimmed
@@ -2194,7 +2801,9 @@ private func computeDailyWorkflow(cards: [TimelineCard], categories: [TimelineCa
         colorHex: colorHex,
         startMinute: startMinute,
         endMinute: endMinute,
-        hasDistraction: !(card.distractions?.isEmpty ?? true)
+        hasDistraction: !(card.distractions?.isEmpty ?? true),
+        cardTitle: card.title,
+        cardDurationMinutes: endMinute - startMinute
       )
     )
   }
@@ -2228,7 +2837,9 @@ private func computeDailyWorkflow(cards: [TimelineCard], categories: [TimelineCa
       colorHex: raw.colorHex,
       startMinute: clippedStart,
       endMinute: clippedEnd,
-      hasDistraction: raw.hasDistraction
+      hasDistraction: raw.hasDistraction,
+      cardTitle: raw.cardTitle,
+      cardDurationMinutes: raw.cardDurationMinutes
     )
   }
 
@@ -2314,17 +2925,41 @@ private func computeDailyWorkflow(cards: [TimelineCard], categories: [TimelineCa
 
   let rows: [DailyWorkflowGridRow] = selectedKeys.map { key in
     let rowSegments = segmentsByCategory[key] ?? []
-    let occupancies: [Double] = (0..<slotCount).map { slotIndex in
+
+    var occupancies: [Double] = []
+    var cardInfos: [DailyWorkflowSlotCardInfo?] = []
+    occupancies.reserveCapacity(slotCount)
+    cardInfos.reserveCapacity(slotCount)
+
+    for slotIndex in 0..<slotCount {
       let slotStart = visibleStart + (Double(slotIndex) * slotDuration)
       let slotEnd = min(visibleEnd, slotStart + slotDuration)
       let slotMinutes = max(1, slotEnd - slotStart)
 
-      let occupied = rowSegments.reduce(0.0) { partial, segment in
-        let overlap = max(0, min(segment.endMinute, slotEnd) - max(segment.startMinute, slotStart))
-        return partial + overlap
+      var totalOccupied = 0.0
+      var bestOverlap = 0.0
+      var bestSegment: DailyWorkflowSegment?
+
+      for segment in rowSegments {
+        let overlap = max(
+          0, min(segment.endMinute, slotEnd) - max(segment.startMinute, slotStart))
+        totalOccupied += overlap
+        if overlap > bestOverlap {
+          bestOverlap = overlap
+          bestSegment = segment
+        }
       }
 
-      return min(1, occupied / slotMinutes)
+      occupancies.append(min(1, totalOccupied / slotMinutes))
+      if let best = bestSegment, bestOverlap > 0 {
+        cardInfos.append(
+          DailyWorkflowSlotCardInfo(
+            title: best.cardTitle,
+            durationMinutes: best.cardDurationMinutes
+          ))
+      } else {
+        cardInfos.append(nil)
+      }
     }
 
     let displayName =
@@ -2336,7 +2971,8 @@ private func computeDailyWorkflow(cards: [TimelineCard], categories: [TimelineCa
       id: key,
       name: displayName,
       colorHex: colorHex,
-      slotOccupancies: occupancies
+      slotOccupancies: occupancies,
+      slotCardInfos: cardInfos
     )
   }
 
@@ -2375,8 +3011,127 @@ private func computeDailyWorkflow(cards: [TimelineCard], categories: [TimelineCa
     ),
   ]
 
+  // Check if user has a Distraction category
+  let distractionCategoryKey = normalizedCategoryKey("Distraction")
+  let hasDistractionCategory = orderedCategories.contains {
+    normalizedCategoryKey($0.name) == distractionCategoryKey
+  }
+
+  // Collect distraction markers from both sources
+  var distractionMarkers: [DailyWorkflowDistractionMarker] = []
+
+  if hasDistractionCategory {
+    var markerIndex = 0
+
+    for card in cards {
+      // Source 1: Full cards categorized as "Distraction"
+      let cardCategoryKey = normalizedCategoryKey(
+        card.category.trimmingCharacters(in: .whitespacesAndNewlines))
+      if cardCategoryKey == distractionCategoryKey {
+        if let rawStart = parseCardMinute(card.startTimestamp),
+          let rawEnd = parseCardMinute(card.endTimestamp)
+        {
+          let (startMin, endMin) = normalizedMinuteRange(start: rawStart, end: rawEnd)
+          let clippedStart = max(startMin, visibleStart)
+          let clippedEnd = min(endMin, visibleEnd)
+          if clippedEnd > clippedStart {
+            distractionMarkers.append(
+              DailyWorkflowDistractionMarker(
+                id: "distraction-macro-\(markerIndex)",
+                title: card.title,
+                startMinute: clippedStart,
+                endMinute: clippedEnd
+              ))
+            markerIndex += 1
+          }
+        }
+      }
+
+      // Source 2: Mini distractions embedded within any card
+      if let distractions = card.distractions {
+        for distraction in distractions {
+          if let rawStart = parseCardMinute(distraction.startTime),
+            let rawEnd = parseCardMinute(distraction.endTime)
+          {
+            var (startMin, endMin) = normalizedMinuteRange(start: rawStart, end: rawEnd)
+            // Ensure mini distractions have at least 1 minute of visual width
+            if endMin - startMin < 1 { endMin = startMin + 1 }
+
+            let clippedStart = max(startMin, visibleStart)
+            let clippedEnd = min(endMin, visibleEnd)
+            if clippedEnd > clippedStart {
+              distractionMarkers.append(
+                DailyWorkflowDistractionMarker(
+                  id: "distraction-mini-\(markerIndex)",
+                  title: distraction.title,
+                  startMinute: clippedStart,
+                  endMinute: clippedEnd
+                ))
+              markerIndex += 1
+            }
+          }
+        }
+      }
+    }
+
+    // Merge overlapping/adjacent markers into single continuous blocks
+    if distractionMarkers.count > 1 {
+      distractionMarkers.sort { $0.startMinute < $1.startMinute }
+      var merged: [DailyWorkflowDistractionMarker] = []
+      var currentStart = distractionMarkers[0].startMinute
+      var currentEnd = distractionMarkers[0].endMinute
+      var currentTitles = [distractionMarkers[0].title]
+
+      for i in 1..<distractionMarkers.count {
+        let marker = distractionMarkers[i]
+        // Merge if overlapping or within 2 minutes of each other
+        if marker.startMinute <= currentEnd + 2 {
+          // Overlapping or touching — extend and collect title
+          currentEnd = max(currentEnd, marker.endMinute)
+          if !currentTitles.contains(marker.title) {
+            currentTitles.append(marker.title)
+          }
+        } else {
+          // Gap — flush current merged marker
+          merged.append(
+            DailyWorkflowDistractionMarker(
+              id: "distraction-merged-\(merged.count)",
+              title: currentTitles.joined(separator: ", "),
+              startMinute: currentStart,
+              endMinute: currentEnd
+            ))
+          currentStart = marker.startMinute
+          currentEnd = marker.endMinute
+          currentTitles = [marker.title]
+        }
+      }
+      // Flush last
+      merged.append(
+        DailyWorkflowDistractionMarker(
+          id: "distraction-merged-\(merged.count)",
+          title: currentTitles.joined(separator: ", "),
+          startMinute: currentStart,
+          endMinute: currentEnd
+        ))
+      distractionMarkers = merged
+    }
+  }
+
   return DailyWorkflowComputationResult(
-    rows: rows, totals: totals, stats: stats, window: workflowWindow)
+    rows: rows, totals: totals, stats: stats, window: workflowWindow,
+    distractionMarkers: distractionMarkers, hasDistractionCategory: hasDistractionCategory)
+}
+
+private func isDistractionCategoryKey(_ key: String) -> Bool {
+  let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+  return normalized == "distraction" || normalized == "distractions"
+}
+
+private func normalizedMinuteRange(start: Double, end: Double) -> (start: Double, end: Double) {
+  let s = start < 240 ? start + 1440 : start
+  var e = end < 240 ? end + 1440 : end
+  if e <= s { e += 1440 }
+  return (s, e)
 }
 
 private func parseCardMinute(_ value: String) -> Double? {
@@ -2422,39 +3177,6 @@ private func formatDurationValue(_ minutes: Double) -> String {
   if hours > 0 && mins > 0 { return "\(hours)h \(mins)m" }
   if hours > 0 { return "\(hours)h" }
   return "\(mins)m"
-}
-
-private enum DailyStandupPlaceholder {
-  static let notGeneratedMessage =
-    "Daily data has not been generated yet. If this is unexpected, please report a bug."
-  static let todayNotGeneratedMessage = "Today's daily recap will be generated tomorrow morning."
-}
-
-private struct DailyStandupDraft: Codable, Equatable, Sendable {
-  var highlightsTitle: String
-  var highlights: [DailyBulletItem]
-  var tasksTitle: String
-  var tasks: [DailyBulletItem]
-  var blockersTitle: String
-  var blockersBody: String
-
-  static let `default` = DailyStandupDraft(
-    highlightsTitle: "Yesterday's highlights",
-    highlights: [DailyBulletItem(text: DailyStandupPlaceholder.notGeneratedMessage)],
-    tasksTitle: "Today's tasks",
-    tasks: [DailyBulletItem(text: DailyStandupPlaceholder.notGeneratedMessage)],
-    blockersTitle: "Blockers",
-    blockersBody: DailyStandupPlaceholder.notGeneratedMessage
-  )
-
-  static let todayPlaceholder = DailyStandupDraft(
-    highlightsTitle: "Yesterday's highlights",
-    highlights: [DailyBulletItem(text: DailyStandupPlaceholder.todayNotGeneratedMessage)],
-    tasksTitle: "Today's tasks",
-    tasks: [DailyBulletItem(text: DailyStandupPlaceholder.todayNotGeneratedMessage)],
-    blockersTitle: "Blockers",
-    blockersBody: DailyStandupPlaceholder.todayNotGeneratedMessage
-  )
 }
 
 struct DailyView_Previews: PreviewProvider {

@@ -103,7 +103,7 @@ struct DayflowApp: App {
   private let updaterManager = UpdaterManager.shared
 
   var body: some Scene {
-    WindowGroup {
+    Window("Dayflow", id: "main") {
       ZStack {
         // Main app UI or onboarding with entrance animation
         Group {
@@ -113,7 +113,7 @@ struct DayflowApp: App {
               .environmentObject(categoryStore)
               .environmentObject(updaterManager)
               .environmentObject(journalCoordinator)
-          } else {
+          } else if !showVideoLaunch {
             OnboardingFlow()
               .environmentObject(AppState.shared)
               .environmentObject(categoryStore)
@@ -173,6 +173,8 @@ struct DayflowApp: App {
       }
       // Inline background behind the main app UI only
       .background {
+        MainWindowRegistrationView()
+
         if didOnboard {
           Image("MainUIBackground")
             .resizable()
@@ -182,11 +184,23 @@ struct DayflowApp: App {
             .accessibilityHidden(true)
         }
       }
-      .frame(minWidth: 900, maxWidth: .infinity, minHeight: 600, maxHeight: .infinity)
+      .onAppear {
+        if !showVideoLaunch {
+          dispatchPendingNotificationNavigation(after: 0.1)
+        }
+      }
+      .onReceive(
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+      ) { _ in
+        if !showVideoLaunch {
+          dispatchPendingNotificationNavigation(after: 0.1)
+        }
+      }
+      .frame(minWidth: 900, maxWidth: .infinity, minHeight: 508, maxHeight: .infinity)
     }
     .windowStyle(.hiddenTitleBar)
     .windowResizability(.contentMinSize)
-    .defaultSize(width: 1200, height: 800)
+    .defaultSize(width: 1195, height: 675)
     .commands {
       // Remove the "New Window" command if you want a single window app
       CommandGroup(replacing: .newItem) {}
@@ -199,6 +213,12 @@ struct DayflowApp: App {
           UserDefaults.standard.set(false, forKey: "didOnboard")
           // Reset the saved onboarding step to start from beginning
           UserDefaults.standard.set(0, forKey: "onboardingStep")
+          UserDefaults.standard.removeObject(forKey: "onboardingHasPaidAI")
+          UserDefaults.standard.removeObject(forKey: CategoryStore.StoreKeys.onboardingSelectedRole)
+          UserDefaults.standard.removeObject(
+            forKey: CategoryStore.StoreKeys.onboardingAppliedCategoryPreset)
+          UserDefaults.standard.removeObject(
+            forKey: CategoryStore.StoreKeys.onboardingCategoriesCustomized)
           // Reset the selected LLM provider to default
           UserDefaults.standard.set("gemini", forKey: "selectedLLMProvider")
           // Force quit and restart the app to show onboarding
@@ -230,24 +250,26 @@ struct DayflowApp: App {
   }
 
   private var hasPendingNotificationNavigation: Bool {
-    AppDelegate.pendingNavigationToJournal || AppDelegate.pendingNavigationToDailyDay != nil
+    AppDelegate.pendingNotificationNavigationDestination != nil
   }
 
   private func dispatchPendingNotificationNavigation(after delay: TimeInterval) {
+    guard hasPendingNotificationNavigation else { return }
+
     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-      if let day = AppDelegate.pendingNavigationToDailyDay, !day.isEmpty {
-        AppDelegate.pendingNavigationToDailyDay = nil
-        AppDelegate.pendingNavigationToJournal = false
+      guard let destination = AppDelegate.pendingNotificationNavigationDestination else { return }
+      AppDelegate.pendingNotificationNavigationDestination = nil
+
+      switch destination {
+      case .daily(let day) where day?.isEmpty == false:
         NotificationCenter.default.post(
           name: .navigateToDaily,
           object: nil,
           userInfo: ["day": day]
         )
-        return
-      }
-
-      if AppDelegate.pendingNavigationToJournal {
-        AppDelegate.pendingNavigationToJournal = false
+      case .daily:
+        NotificationCenter.default.post(name: .navigateToDaily, object: nil)
+      case .journal:
         NotificationCenter.default.post(name: .navigateToJournal, object: nil)
       }
     }
@@ -257,10 +279,49 @@ struct DayflowApp: App {
 // MARK: - Notification Names
 
 extension Notification.Name {
+  static let analyticsPreferenceChanged = Notification.Name("analyticsPreferenceChanged")
   static let showWhatsNew = Notification.Name("showWhatsNew")
   static let navigateToJournal = Notification.Name("navigateToJournal")
   static let navigateToDaily = Notification.Name("navigateToDaily")
   static let timelineDataUpdated = Notification.Name("timelineDataUpdated")
   static let showTimelineFailureToast = Notification.Name("showTimelineFailureToast")
   static let openProvidersSettings = Notification.Name("openProvidersSettings")
+}
+
+@MainActor
+final class MainWindowController {
+  static let shared = MainWindowController()
+
+  private var openWindowAction: OpenWindowAction?
+  private var hasPendingOpenRequest = false
+
+  func register(_ openWindowAction: OpenWindowAction) {
+    self.openWindowAction = openWindowAction
+
+    if hasPendingOpenRequest {
+      hasPendingOpenRequest = false
+      openWindowAction(id: "main")
+    }
+  }
+
+  func showMainWindow() {
+    guard let openWindowAction else {
+      hasPendingOpenRequest = true
+      return
+    }
+
+    openWindowAction(id: "main")
+  }
+}
+
+private struct MainWindowRegistrationView: View {
+  @Environment(\.openWindow) private var openWindow
+
+  var body: some View {
+    Color.clear
+      .frame(width: 0, height: 0)
+      .onAppear {
+        MainWindowController.shared.register(openWindow)
+      }
+  }
 }

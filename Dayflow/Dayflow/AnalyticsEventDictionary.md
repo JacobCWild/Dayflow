@@ -15,6 +15,12 @@ This document lists manual events, properties, and code locations. All events re
 - app_updated
   - props: `from_version: string`, `to_version: string`
   - file: App/AppDelegate.swift
+- app_heartbeat
+  - props: `session_hours: number`, `cpu_current_pct_bucket?: 0-5%|5-20%|20-50%|50-100%|100-150%|150-200%|>200%`, `cpu_avg_pct_bucket?: 0-5%|5-20%|20-50%|50-100%|100-150%|150-200%|>200%`, `cpu_peak_pct_bucket?: 0-5%|5-20%|20-50%|50-100%|100-150%|150-200%|>200%`, `cpu_sample_count?: int`, `cpu_sampler_interval_s?: int`
+  - file: App/AppDelegate.swift
+- app_cpu_spike
+  - props: `cpu_current_pct_bucket: 0-5%|5-20%|20-50%|50-100%|100-150%|150-200%|>200%`, `cpu_hour_peak_pct_bucket: 0-5%|5-20%|20-50%|50-100%|100-150%|150-200%|>200%`, `cpu_threshold_pct: number`, `cpu_sampler_interval_s: int`
+  - file: System/ProcessCPUMonitor.swift
 - app_terminated
   - file: App/AppDelegate.swift
 - screen_viewed
@@ -23,18 +29,21 @@ This document lists manual events, properties, and code locations. All events re
 
 ## Onboarding
 - onboarding_started
-  - file: Views/Onboarding/OnboardingFlow.swift (welcome appear)
+  - file: Views/Onboarding/OnboardingFlow.swift (intro video appear)
 - onboarding_step_completed
-  - props: `step: welcome|how_it_works|llm_selection|llm_setup|categories|screen_recording|completion`
+  - props: `step: intro_video|role_selection|referral|preferences|llm_selection|llm_setup|categories|category_colors|screen_recording|completion`
   - file: Views/Onboarding/OnboardingFlow.swift
 - llm_provider_selected
-  - props: `provider: gemini|ollama|dayflow`
+  - props: `provider: chatgpt_claude|gemini|ollama`, `local_engine?: ollama|lmstudio|custom`
   - file: Views/Onboarding/OnboardingFlow.swift
 - screen_permission_granted / screen_permission_denied
   - file: Views/Onboarding/ScreenRecordingPermissionView.swift
 - connection_test_started / connection_test_succeeded / connection_test_failed
   - props: `provider: gemini`, `error_code?: enum|string`
   - files: Views/Onboarding/TestConnectionView.swift
+- chat_cli_test_started / chat_cli_test_succeeded / chat_cli_test_failed
+  - props: `provider: chatgpt_claude`, `tool: codex|claude`, `setup_step: test`, `duration_ms?: int`, `exit_code?: int`, `failure_reason?: auth_error|nonzero_exit_no_stderr|nonzero_exit_with_stderr|empty_response|unexpected_output|cli_not_found|execution_error`, `error_code?: int`, `error_domain?: string`
+  - file: Views/Onboarding/LLMProviderSetupView.swift
 - onboarding_completed
   - file: Views/Onboarding/OnboardingFlow.swift
 - onboarding_abandoned
@@ -106,8 +115,20 @@ This document lists manual events, properties, and code locations. All events re
 
 ## Recording
 - recording_toggled
-  - props: `enabled: bool`, `reason: user|auto`
+  - props: `enabled: bool`, `reason: auto|unknown|onboarding|deeplink|menu_bar|main_app|user_menu_bar|user_main_app|timer_expired|wake_from_sleep`
   - file: App/AppDelegate.swift (observation) and AppDelegate auto-start
+- recording_paused
+  - props: `source: menu_bar|main_app|deeplink`, `pause_type: 15_mins|30_mins|1_hour|indefinite`
+  - file: App/PauseManager.swift
+- recording_resumed
+  - props: `source: user_menu_bar|user_main_app|timer_expired|wake_from_sleep`, `was_timed: bool`, `original_pause_type: 15_mins|30_mins|1_hour|indefinite|unknown`
+  - file: App/PauseManager.swift
+- timeline_paused_card_clicked
+  - props: `action: resume_recording`
+  - file: Views/UI/CanvasTimelineDataView.swift
+- timeline_stopped_card_clicked
+  - props: `action: start_recording`
+  - file: Views/UI/CanvasTimelineDataView.swift
 - recording_started
   - file: Core/Recording/ScreenRecorder.swift (startStream)
 - recording_stopped

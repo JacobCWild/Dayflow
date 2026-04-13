@@ -55,6 +55,16 @@ final class NotificationService: NSObject, ObservableObject {
     }
   }
 
+  /// Read the current notification authorization status and refresh the cached flag.
+  func authorizationStatus() async -> UNAuthorizationStatus {
+    let settings = await center.notificationSettings()
+    let authorizationStatus = settings.authorizationStatus
+    await MainActor.run {
+      self.permissionGranted = Self.canScheduleNotifications(for: authorizationStatus)
+    }
+    return authorizationStatus
+  }
+
   /// Schedule all reminders based on current preferences
   func scheduleReminders() {
     // First, cancel all existing journal reminders
@@ -306,12 +316,14 @@ final class NotificationService: NSObject, ObservableObject {
   }
 
   private func activateAppForNotificationTap() {
-    NSApp.activate(ignoringOtherApps: true)
     let showDockIcon = UserDefaults.standard.object(forKey: "showDockIcon") as? Bool ?? true
     if showDockIcon && NSApp.activationPolicy() == .accessory {
       NSApp.setActivationPolicy(.regular)
     }
-    NSApp.windows.first?.makeKeyAndOrderFront(nil)
+
+    NSApp.unhide(nil)
+    MainWindowController.shared.showMainWindow()
+    NSApp.activate(ignoringOtherApps: true)
   }
 }
 
@@ -342,21 +354,14 @@ extension NotificationService: UNUserNotificationCenterDelegate {
     Task { @MainActor in
       if isJournalNotification {
         NotificationBadgeManager.shared.showBadge()
-        NotificationCenter.default.post(name: .navigateToJournal, object: nil)
-        AppDelegate.pendingNavigationToJournal = true
+        AppDelegate.pendingNotificationNavigationDestination = .journal
         activateAppForNotificationTap()
         print(
           "[NotificationService] didReceive journal notification handled identifier=\(identifier)")
       } else {
-        AppDelegate.pendingNavigationToDailyDay = day
-        AppDelegate.pendingNavigationToJournal = false
+        AppDelegate.pendingNotificationNavigationDestination = .daily(day: day)
 
         if let day, !day.isEmpty {
-          NotificationCenter.default.post(
-            name: .navigateToDaily,
-            object: nil,
-            userInfo: ["day": day]
-          )
           AnalyticsService.shared.capture(
             "daily_auto_generation_notification_clicked",
             [
@@ -364,7 +369,6 @@ extension NotificationService: UNUserNotificationCenterDelegate {
             ])
           print("[NotificationService] didReceive daily notification navigation target_day=\(day)")
         } else {
-          NotificationCenter.default.post(name: .navigateToDaily, object: nil)
           AnalyticsService.shared.capture(
             "daily_auto_generation_notification_clicked",
             [

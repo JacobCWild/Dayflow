@@ -331,6 +331,12 @@ final class ChatCLIProvider {
             + combinedError)
       } catch {
         lastError = error
+        // Capture partial output from timeout errors for logging
+        if let partialOut = (error as NSError).userInfo["partialStdout"] as? String,
+          !partialOut.isEmpty
+        {
+          lastRawOutput = partialOut
+        }
         print(
           "[ChatCLI] generate_cards attempt " + String(attempt) + " failed: "
             + error.localizedDescription + " — retrying")
@@ -341,9 +347,12 @@ final class ChatCLIProvider {
 
     let finishedAt = lastRun?.finishedAt ?? Date()
     let finalError = lastError ?? CardParseError.decodeFailure(rawOutput: lastRawOutput)
+    let finalStderr =
+      lastRun?.stderr
+      ?? (lastError as NSError?)?.userInfo["partialStderr"] as? String
     logFailure(
       ctx: makeCtx(batchId: batchId, operation: "generate_cards", startedAt: callStart, attempt: 3),
-      finishedAt: finishedAt, error: finalError, stdout: lastRawOutput, stderr: lastRun?.stderr)
+      finishedAt: finishedAt, error: finalError, stdout: lastRawOutput, stderr: finalStderr)
     throw finalError
   }
 
@@ -443,7 +452,9 @@ final class ChatCLIProvider {
           - Slack → slack.com
           - Twitter/X → x.com
           - Messages → support.apple.com/messages
-          - Terminal → omit (no canonical domain)
+          - Terminal → terminal (exception, doens't have a url)
+          - Codex → chatgpt.com
+          - Claude Code/Claude → claude.ai
 
           ✗ WRONG: "primary": "Messages" (app name, not a domain)
           ✗ WRONG: "primary": "Ghostty IDE" (app name, not a domain)
@@ -996,6 +1007,27 @@ final class ChatCLIProvider {
 
   // MARK: - Logging helpers
 
+  private func buildDebugResponseBody(stdout: String, rawStdout: String) -> String {
+    let trimmedStdout = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmedRawStdout = rawStdout.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if trimmedStdout.isEmpty && trimmedRawStdout.isEmpty {
+      return ""
+    }
+
+    var sections: [String] = []
+    if !trimmedStdout.isEmpty {
+      sections.append("[assistant_text]\n" + stdout)
+    }
+    if !trimmedRawStdout.isEmpty && trimmedRawStdout != trimmedStdout {
+      sections.append("[raw_stdout]\n" + rawStdout)
+    } else if sections.isEmpty {
+      sections.append(rawStdout)
+    }
+
+    return sections.joined(separator: "\n\n")
+  }
+
   private func makeCtx(batchId: Int64?, operation: String, startedAt: Date, attempt: Int = 1)
     -> LLMCallContext
   {
@@ -1340,6 +1372,8 @@ final class ChatCLIProvider {
     var actualPrompt = basePrompt
     var lastError: Error?
     var lastRun: ChatCLIRunResult?
+    var lastRawOutput: String = ""
+    var lastRawStderr: String = ""
 
     let maxTranscribeAttempts = 3
     for attempt in 1...maxTranscribeAttempts {
@@ -1348,7 +1382,34 @@ final class ChatCLIProvider {
           prompt: actualPrompt, imagePaths: imagePaths, model: model, reasoningEffort: effort)
         lastRun = run
 
-        let segments = try parseSegments(from: run.stdout, stderr: run.stderr)
+        let segments: [SegmentMergeResponse.Segment]
+        do {
+          segments = try parseSegments(from: run.stdout, stderr: run.stderr)
+        } catch {
+          lastError = error
+          let debugOutput = buildDebugResponseBody(stdout: run.stdout, rawStdout: run.rawStdout)
+          if !debugOutput.isEmpty {
+            lastRawOutput = debugOutput
+            if tool == .claude {
+              print(
+                "[ChatCLI] Claude transcribe_screenshots decode failure (attempt \(attempt)):\n\(debugOutput)"
+              )
+            }
+          }
+          if !run.stderr.isEmpty {
+            lastRawStderr = run.stderr
+          }
+          if attempt < maxTranscribeAttempts {
+            print(
+              "[ChatCLI] Screenshot transcribe attempt \(attempt) failed: \(error.localizedDescription) — retrying"
+            )
+            let backoffSeconds = pow(2.0, Double(attempt - 1)) * 2.0
+            try await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
+            continue
+          }
+          break
+        }
+
         if let validationError = validateSegments(segments, duration: durationSeconds) {
           lastError = NSError(
             domain: "ChatCLI", code: -98, userInfo: [NSLocalizedDescriptionKey: validationError])
@@ -1423,6 +1484,14 @@ final class ChatCLIProvider {
         }
       } catch {
         lastError = error
+        // Capture partial output from timeout errors for logging
+        let nsErr = error as NSError
+        if let partialOut = nsErr.userInfo["partialStdout"] as? String, !partialOut.isEmpty {
+          lastRawOutput = partialOut
+        }
+        if let partialErr = nsErr.userInfo["partialStderr"] as? String, !partialErr.isEmpty {
+          lastRawStderr = partialErr
+        }
         if attempt < maxTranscribeAttempts {
           print(
             "[ChatCLI] Screenshot transcribe attempt \(attempt) failed: \(error.localizedDescription) — retrying"
@@ -1445,11 +1514,16 @@ final class ChatCLIProvider {
           NSLocalizedDescriptionKey:
             "Screenshot transcription failed after \(maxTranscribeAttempts) attempts from \(imagePaths.count) screenshots"
         ])
+    let finalStdout =
+      lastRawOutput.isEmpty
+      ? (lastRun.map { buildDebugResponseBody(stdout: $0.stdout, rawStdout: $0.rawStdout) } ?? "")
+      : lastRawOutput
+    let finalStderr = lastRun?.stderr ?? lastRawStderr
     logFailure(
       ctx: makeCtx(
         batchId: batchId, operation: "transcribe_screenshots", startedAt: callStart,
         attempt: maxTranscribeAttempts), finishedAt: finishedAt, error: finalError,
-      stdout: lastRun?.stdout, stderr: lastRun?.stderr)
+      stdout: finalStdout, stderr: finalStderr)
     throw finalError
   }
 
@@ -1514,9 +1588,6 @@ final class ChatCLIProvider {
   // MARK: - Text Generation (Non-Streaming)
 
   func generateText(prompt: String) async throws -> (text: String, log: LLMCall) {
-    let callStart = Date()
-    let ctx = makeCtx(batchId: nil, operation: "generateText", startedAt: callStart)
-
     let model: String
     switch tool {
     case .claude:
@@ -1525,15 +1596,39 @@ final class ChatCLIProvider {
       model = "gpt-5.2"
     }
 
+    return try await generateText(
+      prompt: prompt,
+      model: model,
+      reasoningEffort: "high",
+      disableTools: false
+    )
+  }
+
+  func generateText(
+    prompt: String,
+    model: String,
+    reasoningEffort: String? = nil,
+    disableTools: Bool = true
+  ) async throws -> (text: String, log: LLMCall) {
+    let callStart = Date()
+    let ctx = makeCtx(batchId: nil, operation: "generateText", startedAt: callStart)
+
     let run: ChatCLIRunResult
     do {
       run = try await Task.detached {
-        // Enable tools so LLM can query the database directly
         try self.runAndScrub(
-          prompt: prompt, model: model, reasoningEffort: "high", disableTools: false)
+          prompt: prompt,
+          model: model,
+          reasoningEffort: reasoningEffort,
+          disableTools: disableTools
+        )
       }.value
     } catch {
-      logFailure(ctx: ctx, finishedAt: Date(), error: error)
+      let nsErr = error as NSError
+      let partialOut = nsErr.userInfo["partialStdout"] as? String
+      let partialErr = nsErr.userInfo["partialStderr"] as? String
+      logFailure(
+        ctx: ctx, finishedAt: Date(), error: error, stdout: partialOut, stderr: partialErr)
       throw error
     }
 

@@ -11,19 +11,22 @@ struct DayflowDailyGenerationRequest: Codable, Sendable {
   let observationsText: String
   let priorDailyText: String
   let preferencesText: String
+  let preferredOutputLanguage: String?
 
   init(
     day: String,
     cardsText: String,
     observationsText: String = "",
     priorDailyText: String = "",
-    preferencesText: String = ""
+    preferencesText: String = "",
+    preferredOutputLanguage: String? = nil
   ) {
     self.day = day
     self.cardsText = cardsText
     self.observationsText = observationsText
     self.priorDailyText = priorDailyText
     self.preferencesText = preferencesText
+    self.preferredOutputLanguage = preferredOutputLanguage
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -32,6 +35,7 @@ struct DayflowDailyGenerationRequest: Codable, Sendable {
     case observationsText = "observations_text"
     case priorDailyText = "prior_daily_text"
     case preferencesText = "preferences_text"
+    case preferredOutputLanguage = "preferred_output_language"
   }
 }
 
@@ -51,7 +55,7 @@ final class DayflowBackendProvider {
     self.endpoint = endpoint
     #if DEBUG
       print(
-        "[DayflowBackendProvider] init endpoint=\(endpoint) auth_id=\(token) auth_id_length=\(token.count)"
+        "[DayflowBackendProvider] init endpoint=\(endpoint) auth_id_length=\(token.count)"
       )
     #endif
   }
@@ -104,7 +108,7 @@ final class DayflowBackendProvider {
       urlRequest.httpBody = try JSONEncoder().encode(request)
       print(
         "[DayflowBackendProvider] daily request_id=\(requestId) day=\(request.day) "
-          + "url=\(url.absoluteString) endpoint_host=\(endpointHost) auth_id=\(token)"
+          + "url=\(url.absoluteString) endpoint_host=\(endpointHost) auth_id_length=\(token.count)"
       )
 
       let requestByteCount = urlRequest.httpBody?.count ?? 0

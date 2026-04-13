@@ -4,16 +4,21 @@ import SwiftUI
 @MainActor
 struct StatusMenuView: View {
   let dismissMenu: () -> Void
+  @ObservedObject private var appState = AppState.shared
   @ObservedObject private var pauseManager = PauseManager.shared
   private let updaterManager = UpdaterManager.shared
+
+  private var controlMode: RecordingControlMode {
+    RecordingControl.currentMode(appState: appState, pauseManager: pauseManager)
+  }
 
   var body: some View {
     VStack(spacing: 6) {
       // Pause/Resume section
-      if pauseManager.isPaused {
-        PausedSection(onResume: resumeRecording)
-      } else {
+      if controlMode == .active {
         PauseSection(onPause: pauseRecording)
+      } else {
+        PausedSection(onResume: resumeRecording)
       }
 
       MenuDivider()
@@ -38,32 +43,23 @@ struct StatusMenuView: View {
   }
 
   private func resumeRecording() {
-    pauseManager.resume(source: .userClickedMenuBar)
+    if pauseManager.isPaused {
+      pauseManager.resume(source: .userClickedMenuBar)
+    } else {
+      RecordingControl.start(reason: "user_menu_bar")
+    }
   }
 
   private func openDayflow() {
-    let menuWindowNumber = NSApp.keyWindow?.windowNumber
-
     performAfterMenuDismiss {
-      // Only show Dock icon if user preference allows it
       let showDockIcon = UserDefaults.standard.object(forKey: "showDockIcon") as? Bool ?? true
       if showDockIcon {
         NSApp.setActivationPolicy(.regular)
       }
+
       NSApp.unhide(nil)
+      MainWindowController.shared.showMainWindow()
       NSApp.activate(ignoringOtherApps: true)
-
-      var showedWindow = false
-      for window in NSApp.windows
-      where window.canBecomeKey && window.windowNumber != menuWindowNumber {
-        if window.isMiniaturized { window.deminiaturize(nil) }
-        window.makeKeyAndOrderFront(nil)
-        showedWindow = true
-      }
-
-      if !showedWindow {
-        MainWindowManager.shared.showMainWindow()
-      }
     }
   }
 

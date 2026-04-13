@@ -14,11 +14,15 @@ final class AppState: ObservableObject, AppStateManaging {  // <-- Add AppStateM
 
   private let recordingKey = "isRecording"
   private var shouldPersist = false
+  private var skipNextPersistence = false
+  private var pendingRecordingAnalyticsReason: String?
 
   @Published var isRecording: Bool {
     didSet {
+      defer { skipNextPersistence = false }
+
       // Only persist after onboarding is complete
-      if shouldPersist {
+      if shouldPersist && !skipNextPersistence {
         UserDefaults.standard.set(isRecording, forKey: recordingKey)
       }
     }
@@ -41,5 +45,23 @@ final class AppState: ObservableObject, AppStateManaging {  // <-- Add AppStateM
       return UserDefaults.standard.bool(forKey: recordingKey)
     }
     return nil
+  }
+
+  func setRecording(
+    _ enabled: Bool,
+    analyticsReason: String? = nil,
+    persistPreference: Bool = true
+  ) {
+    if let analyticsReason {
+      pendingRecordingAnalyticsReason = analyticsReason
+    }
+    skipNextPersistence = !persistPreference
+    isRecording = enabled
+  }
+
+  func consumePendingRecordingAnalyticsReason() -> String? {
+    let reason = pendingRecordingAnalyticsReason
+    pendingRecordingAnalyticsReason = nil
+    return reason
   }
 }
